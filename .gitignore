@@ -1,0 +1,8 @@
+/target/
+.sss.json
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+/data/
