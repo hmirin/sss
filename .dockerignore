@@ -1,0 +1,8 @@
+.git
+target
+.sss.json
+.env
+.env.*
+*.pem
+*.key
+data
