@@ -1,9 +1,8 @@
-use crate::{hash, valid_path, AuthArgs, Cli, Command, KeyCommand};
+use crate::{auth::Rule, hash, valid_path, Cli, Command, ProjectArgs};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -11,22 +10,20 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
 };
-#[derive(Serialize, Deserialize)]
-struct Config {
-    upstream: String,
-    project: String,
-}
 struct Client {
     http: reqwest::Client,
     upstream: String,
-    key: String,
+    credential: Option<String>,
 }
 impl Client {
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let mut req = self
             .http
-            .request(method, format!("{}{path}", self.upstream))
-            .bearer_auth(&self.key);
+            .request(method, format!("{}{path}", self.upstream));
+        if let Some(v) = &self.credential {
+            let (u, p) = crate::auth::split(v)?;
+            req = req.basic_auth(u, Some(p));
+        }
         if let Some(b) = body {
             req = req.json(&b)
         }
@@ -35,26 +32,43 @@ impl Client {
         let body = resp.text().await?;
         if !status.is_success() {
             bail!("server returned {status}: {body}")
-        };
+        }
         Ok(serde_json::from_str(&body)?)
     }
 }
-fn password(a: &AuthArgs) -> Result<Option<String>> {
-    if a.no_basic_auth {
-        return Ok(None);
-    }
-    if a.password_stdin {
-        let mut s = String::new();
-        std::io::stdin().take(4098).read_to_string(&mut s)?;
-        return Ok(Some(s.trim_end_matches(['\r', '\n']).to_owned()));
-    }
-    if let Some(p) = &a.basic_auth {
-        if p.is_empty() {
-            return Ok(Some(rpassword::prompt_password("Viewing password: ")?));
+fn project_body(args: &ProjectArgs) -> Result<Value> {
+    let mut body = if let Some(p) = &args.config {
+        let mut bytes = Vec::new();
+        if p == Path::new("-") {
+            std::io::stdin().take(1024 * 1024).read_to_end(&mut bytes)?;
+        } else {
+            bytes = fs::read(p)?;
         }
-        return Ok(Some(p.clone()));
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid project JSON"))?
+    } else {
+        json!({})
+    };
+    if !body.is_object() {
+        bail!("project config must be an object")
     }
-    Ok(None)
+    if let Some(name) = &args.name {
+        body["name"] = json!(name)
+    }
+    if args.view.is_some() || args.write.is_some() {
+        if body.get("auth").is_none() {
+            body["auth"] = json!({})
+        }
+        if !body["auth"].is_object() {
+            bail!("auth must be an object")
+        }
+        for (key, arg) in [("view", &args.view), ("write", &args.write)] {
+            if let Some(v) = arg {
+                body["auth"][key] = serde_json::to_value(Rule::argument(v)?)?;
+            }
+        }
+    }
+    Ok(body)
 }
 fn matcher(root: &Path) -> Result<Gitignore> {
     let mut b = GitignoreBuilder::new(root);
@@ -156,79 +170,132 @@ fn collect(root: &Path, inputs: &[PathBuf], directory: bool) -> Result<BTreeMap<
     }
     Ok(result)
 }
-fn print(value: &Value, json_output: bool) {
-    if json_output {
-        println!("{value}")
-    } else if value.get("dry_run").and_then(Value::as_bool) == Some(true) {
-        println!("{}", serde_json::to_string_pretty(value).unwrap());
-    } else if let Some(url) = value.get("url").and_then(Value::as_str) {
-        println!("{url}")
-    } else {
-        println!("{}", serde_json::to_string_pretty(value).unwrap())
-    }
-}
+
 pub async fn run(cli: &Cli) -> Result<()> {
-    let cfg = if Path::new(".sss.json").exists() {
-        Some(serde_json::from_slice::<Config>(&fs::read(".sss.json")?)?)
-    } else {
-        None
-    };
-    let upstream = cli
-        .upstream
-        .as_deref()
-        .or(cfg.as_ref().map(|c| c.upstream.as_str()))
-        .context("specify --upstream or create .sss.json with sss new")?;
-    let url = url::Url::parse(upstream)?;
-    if url.host_str().is_none()
+    let url = url::Url::parse(&cli.upstream)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        bail!("upstream must be an origin URL")
-    };
-    let loopback = url.host_str().is_some_and(|h| {
-        h == "localhost"
-            || h == "[::1]"
-            || h.parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if url.scheme() != "https" && !(url.scheme() == "http" && (loopback || cli.allow_http)) {
-        bail!("HTTPS required (except loopback; --allow-http permits an explicit test origin)")
+        bail!("upstream must be an HTTP(S) origin URL")
+    }
+    if let Some(v) = &cli.basic_auth {
+        crate::auth::split(v)?;
     }
     let client = Client {
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(120))
             .build()?,
-        upstream: upstream.trim_end_matches('/').into(),
-        key: std::env::var("SSS_API_KEY").context("set SSS_API_KEY")?,
+        upstream: cli.upstream.trim_end_matches('/').into(),
+        credential: cli.basic_auth.clone(),
     };
-    let project = cli
-        .project
-        .as_deref()
-        .or(cfg.as_ref().map(|c| c.project.as_str()));
+    let project = cli.project.as_deref();
     if let Some(p) = project {
         if p.is_empty() || !p.bytes().all(|c| c.is_ascii_alphanumeric()) {
             bail!("invalid project ID")
         }
     }
-    let p = || project.context("specify --project or create .sss.json with sss new");
-    let result=match &cli.command{
-  Command::New(args)=>{if cfg.is_some(){bail!(".sss.json already exists; use another directory for a new project")};let result=client.call(Method::POST,"/api/projects",Some(json!({"basic_password":password(args)?}))).await?;let config=Config{upstream:client.upstream.clone(),project:result["project"].as_str().context("missing project ID")?.into()};let mut f=fs::OpenOptions::new().write(true).create_new(true).open(".sss.json")?;use std::io::Write;f.write_all(serde_json::to_string_pretty(&config)?.as_bytes())?;result},
-  Command::Upload{files}=>{let files=collect(&std::env::current_dir()?,files,false)?;publish(&client,p()?,files,false,false).await?},
-  Command::Sync{dir,dry_run}=>{let files=collect(dir,&[],true)?;publish(&client,p()?,files,true,*dry_run).await?},
-  Command::Delete{files}=>{let p=p()?;if files.is_empty(){client.call(Method::DELETE,&format!("/api/projects/{p}"),None).await?}else{for f in files{if !valid_path(f){bail!("unsafe path")}}let m=client.call(Method::GET,&format!("/api/projects/{p}/manifest"),None).await?;client.call(Method::POST,&format!("/api/projects/{p}/files"),Some(json!({"mode":"delete","delete":files,"base_revision":m["revision"]}))).await?}},
-  Command::Config(args)=>{if args.basic_auth.is_none() && !args.password_stdin && !args.no_basic_auth{bail!("specify --basic-auth, --password-stdin, or --no-basic-auth")};client.call(Method::PATCH,&format!("/api/projects/{}",p()?),Some(json!({"basic_password":password(args)?}))).await?},
-  Command::Keys{command}=>match command{
-   KeyCommand::Create{scope,expires_in}=>client.call(Method::POST,"/api/keys",Some(json!({"project":p()?,"scopes":scope.split(',').collect::<Vec<_>>(),"expires_in":expires_in}))).await?,
-   KeyCommand::List=>client.call(Method::GET,"/api/keys",None).await?,
-   KeyCommand::Revoke{key_id}=>{if key_id.is_empty()||!key_id.bytes().all(|c|c.is_ascii_alphanumeric()){bail!("invalid key ID")};client.call(Method::DELETE,&format!("/api/keys/{key_id}"),None).await?}
-  },
-  _=>unreachable!()
- };
-    print(&result, cli.json);
+    let p = || project.context("specify --project ID");
+    let result = match cli.command.as_ref().unwrap() {
+        Command::New(a) => {
+            client
+                .call(Method::POST, "/api/projects", Some(project_body(a)?))
+                .await?
+        }
+        Command::List => client.call(Method::GET, "/api/projects", None).await?,
+        Command::Upload { files } => {
+            publish(
+                &client,
+                p()?,
+                collect(&std::env::current_dir()?, files, false)?,
+                false,
+                false,
+            )
+            .await?
+        }
+        Command::Sync { dir, dry_run } => {
+            publish(&client, p()?, collect(dir, &[], true)?, true, *dry_run).await?
+        }
+        Command::Delete { files } => {
+            let p = p()?;
+            if files.is_empty() {
+                client
+                    .call(Method::DELETE, &format!("/api/projects/{p}"), None)
+                    .await?
+            } else {
+                for f in files {
+                    if !valid_path(f) {
+                        bail!("unsafe path")
+                    }
+                }
+                let m = client
+                    .call(Method::GET, &format!("/api/projects/{p}/manifest"), None)
+                    .await?;
+                client
+                    .call(
+                        Method::POST,
+                        &format!("/api/projects/{p}/versions"),
+                        Some(json!({"mode":"delete","delete":files,"base_revision":m["revision"]})),
+                    )
+                    .await?
+            }
+        }
+        Command::Config(a) => {
+            let body = project_body(a)?;
+            if body.get("name").is_some() {
+                bail!("config changes authentication only")
+            }
+            let access = body
+                .get("auth")
+                .context("specify --basic_auth_view, --basic_auth_write, or an auth config")?
+                .clone();
+            client
+                .call(
+                    Method::PATCH,
+                    &format!("/api/projects/{}/auth", p()?),
+                    Some(access),
+                )
+                .await?
+        }
+        Command::Versions => {
+            client
+                .call(
+                    Method::GET,
+                    &format!("/api/projects/{}/versions", p()?),
+                    None,
+                )
+                .await?
+        }
+        Command::Rollback { version } => {
+            let p = p()?;
+            let m = client
+                .call(Method::GET, &format!("/api/projects/{p}/manifest"), None)
+                .await?;
+            client
+                .call(
+                    Method::PUT,
+                    &format!("/api/projects/{p}/current"),
+                    Some(json!({"version":version,"base_revision":m["revision"]})),
+                )
+                .await?
+        }
+        Command::DeleteVersion { version } => {
+            client
+                .call(
+                    Method::DELETE,
+                    &format!("/api/projects/{}/versions/{version}", p()?),
+                    None,
+                )
+                .await?
+        }
+        _ => unreachable!(),
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 async fn publish(
@@ -256,10 +323,21 @@ async fn publish(
     } else {
         vec![]
     };
-    if dry || (changed.is_empty() && removed.is_empty()) {
+    if dry {
+        let added: Vec<_> = changed
+            .keys()
+            .filter(|k| !remote.contains_key(*k))
+            .collect();
+        let modified: Vec<_> = changed.keys().filter(|k| remote.contains_key(*k)).collect();
         return Ok(
-            json!({"project":p,"dry_run":dry,"changed":changed.keys().collect::<Vec<_>>(),"deleted":removed,"revision":m["revision"],"url":format!("{}/s/{p}/",c.upstream)}),
+            json!({"project":p,"dry_run":true,"added":added,"modified":modified,"deleted":removed}),
         );
+    }
+    if changed.is_empty() && removed.is_empty() && m["version"].as_u64() != Some(0) {
+        let mut result = m.clone();
+        result.as_object_mut().unwrap().remove("files");
+        result["unchanged"] = json!(true);
+        return Ok(result);
     }
     let mut body =
         json!({"mode":if sync{"sync"}else{"upload"},"files":changed,"base_revision":m["revision"]});
@@ -268,7 +346,7 @@ async fn publish(
     };
     c.call(
         Method::POST,
-        &format!("/api/projects/{p}/files"),
+        &format!("/api/projects/{p}/versions"),
         Some(body),
     )
     .await

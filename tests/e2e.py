@@ -1,59 +1,67 @@
 #!/usr/bin/env python3
-"""Disposable black-box integration checks; Python standard library only."""
-import argparse, base64, json, os, socket, subprocess, tempfile, time
+"""Disposable black-box acceptance tests. No production services or credentials."""
+import base64
+import json
+import os
 from pathlib import Path
-from urllib.request import Request, urlopen
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+BINARY = str(Path(sys.argv[1]).resolve())
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('binary', type=Path)
-    binary = str(p.parse_args().binary.resolve())
+def exercise(shared):
     with tempfile.TemporaryDirectory(prefix='sss-e2e-') as tmp:
         root = Path(tmp)
         work = root / 'work'
         work.mkdir()
         data = root / 'data'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('SSS_')}
+        env['HOME'] = str(root)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
         upstream = f'http://127.0.0.1:{port}'
-        env = dict(os.environ)
-        env.pop('SSS_API_KEY', None)
-        def cli(*args, token=None, ok=True, stdin=None, parsed=False):
-            e = dict(env)
-            if token is not None:
-                e['SSS_API_KEY'] = token
-            r = subprocess.run([binary, *args], cwd=work, env=e, input=stdin, text=True, capture_output=True)
-            assert (r.returncode == 0) == ok, (args, r.returncode, r.stderr)
-            return json.loads(r.stdout) if parsed else r.stdout.strip()
-        admin = cli('admin-key', '--data-dir', str(data))
         process = None
         log = open(root / 'server.log', 'w+')
-        def request(path, method='GET', body=None, token=None, basic=None):
+
+        def cli(*args, credential=shared, ok=True, stdin=None, extra_env=None):
+            e = dict(env, SSS_UPSTREAM=upstream)
+            if credential is not None:
+                e['SSS_BASIC_AUTH'] = credential
+            e.update(extra_env or {})
+            result = subprocess.run([BINARY, *args], cwd=work, env=e, input=stdin,
+                                    text=True, capture_output=True, timeout=30)
+            assert (result.returncode == 0) == ok, (args, result.stderr)
+            return json.loads(result.stdout) if ok else result.stderr
+
+        def request(path, method='GET', body=None, credential=None):
             headers = {}
-            if token:
-                headers['Authorization'] = 'Bearer ' + token
-            if basic:
-                headers['Authorization'] = 'Basic ' + base64.b64encode(basic.encode()).decode()
-            payload = None
+            if credential:
+                headers['Authorization'] = 'Basic ' + base64.b64encode(credential.encode()).decode()
             if body is not None:
-                payload = json.dumps(body).encode()
                 headers['Content-Type'] = 'application/json'
             try:
-                r = urlopen(Request(upstream + path, data=payload, headers=headers, method=method), timeout=5)
+                response = urlopen(Request(upstream + path, method=method, headers=headers,
+                    data=None if body is None else json.dumps(body).encode()), timeout=10)
             except HTTPError as err:
-                r = err
-            return r.status, r.read()
-        def api(path, method='GET', body=None, token=admin):
-            status, payload = request(path, method, body, token)
-            assert 200 <= status < 300, (path, status, payload)
-            return json.loads(payload) if payload else {}
+                response = err
+            return response.status, response.read()
+
         def start():
             nonlocal process
-            process = subprocess.Popen([binary, 'serve', '--listen', f'127.0.0.1:{port}', '--data-dir', str(data), '--public-url', upstream], stdout=log, stderr=log)
-            for _ in range(100):
+            e = dict(env, SSS_LISTEN='127.0.0.1', SSS_PORT=str(port),
+                     SSS_DATA_DIR=str(data), SSS_PUBLIC_URL=upstream)
+            if shared:
+                e['SSS_BASIC_AUTH'] = shared
+            process = subprocess.Popen([BINARY, 'serve'], env=e, stdout=log, stderr=log)
+            for _ in range(150):
                 try:
                     if request('/health')[0] == 200:
                         return
@@ -61,118 +69,137 @@ def main():
                     pass
                 if process.poll() is not None:
                     log.seek(0)
-                    raise AssertionError('server exited: ' + log.read())
+                    raise AssertionError(log.read())
                 time.sleep(.05)
-            raise AssertionError('server start timeout')
+            raise AssertionError('server readiness timed out')
+
         def stop():
             if process and process.poll() is None:
                 process.terminate()
                 process.wait(timeout=10)
-        def run(*args, **kw):
-            return cli('--upstream', upstream, '--allow-http', *args, token=kw.pop('token', admin), **kw)
-        def remote(path, content=None, status=200, basic=None):
-            actual, body = request(f'/s/{project}/' + path, basic=basic)
-            assert actual == status, (path, actual, status)
-            if content is not None:
-                assert body == content.encode(), (path, body)
+
         try:
             start()
-            assert request('/api/projects', 'POST', {})[0] in (401, 403)
-            assert request('/api/projects', 'POST', {}, 'invalid')[0] in (401, 403)
-            created = run('--json', 'new', parsed=True)
-            config = json.loads((work / '.sss.json').read_text())
-            project = config.get('project') or config.get('project_id') or created.get('id')
-            assert project, (created, config)
-            assert admin not in json.dumps(config)
-            (work / 'index.html').write_text('version one')
+            if shared:
+                assert request('/api/projects', 'POST', {})[0] == 401
+                assert request('/api/projects')[0] == 401
+                assert 'SSS_BASIC_AUTH' in cli('new', credential=None, ok=False)
+            # Repeated creation in one directory, JSON by default, no binding file.
+            first = cli('new', '--name', 'hello')
+            p = first['id']
+            other = cli('new', '--name', 'other')['id']
+            assert p != other and first['url'] == f'{upstream}/s/{p}/'
+            assert not (work / '.sss.json').exists()
+            assert len(cli('list')['projects']) == 2
+            cli('sync', '.', ok=False)  # No implicit last-used project.
+            # Upstream flag overrides environment; Basic flag overrides bad environment.
+            cli('--upstream', upstream, 'list', extra_env={'SSS_UPSTREAM': 'http://127.0.0.1:1'})
+            if shared:
+                cli('list', '--basic_auth', shared, credential='wrong:password')
+            (work / 'index.html').write_text('one')
             (work / 'assets').mkdir()
             (work / 'assets/style.css').write_text('body{}')
-            run('upload', 'index.html', 'assets/style.css')
-            remote('index.html', 'version one')
-            remote('assets/style.css', 'body{}')
-            (work / 'index.html').write_text('version two')
-            run('upload', 'index.html')
-            remote('index.html', 'version two')
-            remote('assets/style.css', 'body{}')
-            for name, content in [('.env', 'DUMMY_SECRET=never-upload'), ('.sssignore', 'ignored.txt\n'), ('ignored.txt', 'ignored')]:
-                (work / name).write_text(content)
-            (work / '.git').mkdir()
-            (work / '.git/config').write_text('dummy')
+            v1 = cli('sync', '.', '--project', p)
+            assert v1['version'] == 1
+            assert v1['version_url'] == f'{upstream}/s/{p}/versions/1/'
+            for path in ['', 'versions/1/', 'versions/1/assets/style.css']:
+                assert request(f'/s/{p}/{path}', credential=shared)[0] == 200
+                if shared:
+                    assert request(f'/s/{p}/{path}')[0] == 401
+            (work / 'index.html').write_text('two')
+            v2 = cli('upload', 'index.html', '--project', p)
+            assert v2['version'] == 2
+            assert request(f'/s/{p}/assets/style.css', credential=shared)[1] == b'body{}'
+            assert request(f'/s/{p}/versions/1/', credential=shared)[1] == b'one'
+            assert request(f'/s/{p}/', credential=shared)[1] == b'two'
+            # Dry-run distinguishes additions, modifications and deletions.
             (work / 'assets/style.css').unlink()
-            (work / 'index.html').write_text('version three')
-            run('sync', '.', '--dry-run')
-            remote('index.html', 'version two')
-            remote('assets/style.css', 'body{}')
-            run('sync', '.')
-            remote('index.html', 'version three')
-            stable = api(f'/api/projects/{project}/manifest')
-            run('sync', '.')
-            assert stable == api(f'/api/projects/{project}/manifest')
-            (root / 'outside.txt').write_text('outside')
-            (work / 'escape.txt').symlink_to(root / 'outside.txt')
-            run('upload', 'escape.txt', ok=False)
-            run('sync', '.', ok=False)
-            (work / 'escape.txt').unlink()
-            (work / 'escape-dir').symlink_to(root, target_is_directory=True)
-            run('upload', 'escape-dir/outside.txt', ok=False)
-            (work / 'escape-dir').unlink()
-            assert stable == api(f'/api/projects/{project}/manifest')
-            for name in ['assets/style.css', '.env', '.sss.json', '.sssignore', '.git/config', 'ignored.txt']:
-                remote(name, status=404)
-            (work / 'assets/style.css').write_text('protected{}')
-            run('upload', 'assets/style.css')
-            run('config', '--basic-auth', '--password-stdin', stdin='test-password\n')
-            remote('index.html', status=401)
-            remote('assets/style.css', status=401)
-            remote('assets/style.css', 'protected{}', basic='sss:test-password')
-            remote('index.html', 'version three', basic='sss:test-password')
-            remote('index.html', status=401, basic='sss:wrong')
-            remote('not-found.css', status=401)
-            run('config', '--no-basic-auth')
-            manifest = api(f'/api/projects/{project}/manifest')
-            for path in ['../escape', '/absolute', 'a/../../escape', 'a\\..\\escape']:
-                status, _ = request(f'/api/projects/{project}/files', 'POST', {'mode':'upload', 'files':{'index.html':base64.b64encode(b'partial-write').decode(), path:base64.b64encode(b'bad').decode()}, 'base_revision':manifest['revision']}, admin)
-                assert status == 400, (path, status)
-            assert manifest['files'] == api(f'/api/projects/{project}/manifest')['files']
-            status, _ = request(f'/api/projects/{project}/files', 'POST', {'mode':'upload', 'files':{'index.html':base64.b64encode(b'bad').decode()}, 'base_revision':'stale-revision'}, admin)
-            assert status == 409, status
-            remote('index.html', 'version three')
-            upload_key = run('--json', 'keys', 'create', '--project', project, '--scope', 'upload', parsed=True)
-            current = api(f'/api/projects/{project}/manifest')
-            status, _ = request(f'/api/projects/{project}/files', 'POST', {'mode':'upload', 'files':{}, 'delete':['index.html'], 'base_revision':current['revision']}, upload_key['key'])
-            assert status == 400, status
-            remote('index.html', 'version three')
-            assert current == api(f'/api/projects/{project}/manifest')
-            key = run('--json', 'keys', 'create', '--project', project, '--scope', 'upload,sync', parsed=True)
-            token, key_id = key.get('token') or key.get('key'), key.get('id') or key.get('key_id')
-            assert token and key_id, key
-            (work / 'index.html').write_text('scoped upload')
-            run('upload', 'index.html', token=token)
-            remote('index.html', 'scoped upload')
-            assert request('/api/projects', 'POST', {}, token)[0] in (401, 403)
-            other = api('/api/projects', 'POST', {})
-            other_id = other.get('id') or other.get('project')
-            assert request(f'/api/projects/{other_id}/manifest', token=token)[0] in (401, 403)
-            assert request(f'/api/projects/{project}', 'DELETE', token=token)[0] in (401, 403)
-            assert token not in json.dumps(run('--json', 'keys', 'list', parsed=True))
-            run('keys', 'revoke', key_id)
-            run('upload', 'index.html', token=token, ok=False)
-            expired = run('--json', 'keys', 'create', '--project', project, '--scope', 'upload', '--expires-in', '1', parsed=True)
-            time.sleep(1.2)
-            run('upload', 'index.html', token=expired.get('token') or expired.get('key'), ok=False)
+            (work / 'index.html').write_text('three')
+            (work / 'new.txt').write_text('new')
+            (work / '.env').write_text('SECRET=fixture')
+            (work / '.sssignore').write_text('ignored.txt\n')
+            (work / 'ignored.txt').write_text('ignored')
+            preview = cli('sync', '.', '--project', p, '--dry-run')
+            assert preview == {'project': p, 'dry_run': True, 'added': ['new.txt'],
+                               'modified': ['index.html'], 'deleted': ['assets/style.css']}
+            assert request(f'/s/{p}/', credential=shared)[1] == b'two'
+            v3 = cli('sync', '.', '--project', p)
+            assert v3['version'] == 3
+            for name in ['.env', 'ignored.txt', 'assets/style.css']:
+                assert request(f'/s/{p}/{name}', credential=shared)[0] == 404
+            assert cli('sync', '.', '--project', p)['unchanged']
+            assert cli('versions', '--project', p)['versions'] == [1, 2, 3]
+            # Reject traversal, reserved version paths and stale writes atomically.
+            status, payload = request(f'/api/projects/{p}/manifest', credential=shared)
+            manifest = json.loads(payload)
+            for path in ['../escape', '/absolute', 'x/../../escape', 'x\\y', 'versions/1/index.html']:
+                body = {'mode': 'upload', 'base_revision': manifest['revision'],
+                        'files': {'index.html': base64.b64encode(b'bad').decode(), path: ''}}
+                assert request(f'/api/projects/{p}/versions', 'POST', body, shared)[0] == 400
+            assert request(f'/api/projects/{p}/versions', 'POST',
+                {'mode': 'upload', 'base_revision': 'stale', 'files': {}}, shared)[0] == 409
+            (work / 'link').symlink_to(root / 'server.log')
+            cli('sync', '.', '--project', p, ok=False)
+            (work / 'link').unlink()
+            # Rollback changes concurrency token, preserves snapshots; deleted numbers never reused.
+            rollback = cli('rollback', '1', '--project', p)
+            assert rollback['revision'] != manifest['revision']
+            assert request(f'/s/{p}/', credential=shared)[1] == b'one'
+            cli('delete-version', '1', '--project', p, ok=False)
+            cli('delete-version', '2', '--project', p)
+            assert request(f'/s/{p}/versions/2/', credential=shared)[0] == 404
+            assert cli('sync', '.', '--project', p)['version'] == 4
             stop()
             start()
-            remote('index.html', 'scoped upload')
-            run('upload', 'index.html', token=token, ok=False)
-            run('delete', 'index.html')
-            remote('index.html', status=404)
-            run('delete', '--project', project)
-            assert request(f'/api/projects/{project}/manifest', token=admin)[0] == 404
-            api(f'/api/projects/{other_id}', 'DELETE')
-            print('PASS: lifecycle, nested upload, overwrite, mirror/dry-run/exclusions, auth, key isolation/revoke/expiry, traversal, symlinks, no-op revisions, batch rejection, stale revision, persistence, deletion')
+            assert cli('versions', '--project', p) == {'project': p, 'current': 4, 'versions': [1, 3, 4]}
+            assert request(f'/s/{p}/versions/1/', credential=shared)[1] == b'one'
+            # Per-project credentials and overrides (also when no shared credential exists).
+            config = {'name': 'protected', 'auth': {'view': {'mode': 'basic', 'username': 'reader',
+                'password': 'view-password'}, 'write': {'mode': 'basic', 'username': 'writer', 'password': 'write:password'}}}
+            private = cli('new', '--config', '-', stdin=json.dumps(config))['id']
+            cli('sync', '.', '--project', private, credential=None, ok=False)
+            cli('sync', '.', '--project', private, credential='reader:view-password', ok=False)
+            cli('sync', '.', '--project', private, credential='writer:write:password')
+            assert request(f'/s/{private}/')[0] == 401
+            assert request(f'/s/{private}/versions/1/', credential='reader:view-password')[0] == 200
+            assert request(f'/s/{private}/versions/1/', credential='writer:write:password')[0] == 401
+            if shared:
+                cli('new', credential='writer:write:password', ok=False)
+                cli('sync', '.', '--project', other, credential='writer:write:password', ok=False)
+                cli('config', '--project', private, '--basic_auth_view', 'none', credential='writer:write:password', ok=False)
+                assert request(f'/s/{private}/', credential=shared)[0] == 200
+            cli('config', '--project', private, '--basic_auth_view', 'reader:new-password')
+            assert request(f'/s/{private}/versions/1/', credential='reader:view-password')[0] == 401
+            assert request(f'/s/{private}/versions/1/', credential='reader:new-password')[0] == 200
+            cli('config', '--project', private, '--basic_auth_view', 'none', '--basic_auth_write', 'none')
+            assert request(f'/s/{private}/')[0] == 200
+            cli('sync', '.', '--project', private, credential=None)
+            cli('config', '--project', private, '--basic_auth_view', 'inherit', '--basic_auth_write', 'inherit')
+            assert request(f'/s/{private}/')[0] == (401 if shared else 200)
+            # Flags override JSON settings; no cleartext credentials in database.
+            public = cli('new', '--config', '-', '--basic_auth_view', 'none', '--basic_auth_write', 'none', stdin=json.dumps(config))['id']
+            cli('sync', '.', '--project', public, credential=None)
+            assert request(f'/s/{public}/')[0] == 200
+            db = sqlite3.connect(data / 'sss.db')
+            stored = '\n'.join(r[0] for r in db.execute('SELECT auth FROM projects'))
+            for secret in ['view-password', 'write:password', 'new-password']:
+                assert secret not in stored
+            db.close()
+            cli('delete', 'index.html', '--project', p)
+            assert request(f'/s/{p}/', credential=shared)[0] == 404
+            assert request(f'/s/{p}/versions/1/', credential=shared)[1] == b'one'
+            for project in [p, other, private, public]:
+                cli('delete', '--project', project)
+            assert cli('list')['projects'] == []
         finally:
             stop()
             log.close()
 
+
 if __name__ == '__main__':
-    main()
+    exercise(None)
+    exercise('admin:shared-password')
+    skill = subprocess.check_output([BINARY, '--skill'], text=True)
+    assert skill.startswith('---\nname: sss\n')
+    assert 'SSS_API_KEY' not in skill
+    print('PASS: anonymous/shared/project auth, CLI precedence, multi-project workflow, version snapshots/rollback/deletion/restart, sync/dry-run/exclusions, atomic rejection, embedded skill')

@@ -2,7 +2,7 @@
 name = "sss"
 version = "0.1.0"
 edition = "2021"
-description = "Simple Serve System: atomic static publishing in one binary"
+description = "Simple Static Site: atomic static publishing in one binary"
 license = "MIT"
 
 [dependencies]
@@ -17,7 +17,6 @@ ignore = "0.4"
 mime_guess = "2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,5 +25,8 @@ tokio = { version = "1", features = ["full"] }
 url = "2"
 walkdir = "2"
 
-[dev-dependencies]
 tempfile = "3"
+semver = "1"
+flate2 = "1"
+tar = "0.4"
+attestation-verify = { git = "https://github.com/combinatrix-ai/attestation-verify", rev = "73d3b53ecbf2d3c71846ae4cab3fa6482be012eb" }

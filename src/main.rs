@@ -1,96 +1,140 @@
+mod auth;
 mod client;
 mod server;
+mod update;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about = "Simple Static Site: publish static files from any machine",
+    subcommand_required = false
+)]
 pub struct Cli {
-    #[arg(long, global = true)]
-    pub upstream: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "SSS_UPSTREAM",
+        default_value = "http://localhost:8080"
+    )]
+    pub upstream: String,
     #[arg(long, global = true)]
     pub project: Option<String>,
-    #[arg(long, global = true)]
-    pub json: bool,
-    #[arg(long, global = true)]
-    pub allow_http: bool,
+    #[arg(
+        long = "basic_auth",
+        global = true,
+        env = "SSS_BASIC_AUTH",
+        hide_env_values = true
+    )]
+    pub basic_auth: Option<String>,
+    #[arg(long)]
+    pub skill: bool,
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 #[derive(Subcommand)]
 pub enum Command {
+    /// Run the HTTP server.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        listen: String,
-        #[arg(long)]
-        data_dir: PathBuf,
-        #[arg(long)]
-        public_url: String,
+        #[arg(long, env = "SSS_LISTEN", default_value = "127.0.0.1")]
+        listen: std::net::IpAddr,
+        #[arg(long, env = "SSS_PORT", default_value_t = 8080)]
+        port: u16,
+        #[arg(long, env = "SSS_DATA_DIR")]
+        data_dir: Option<PathBuf>,
+        #[arg(long, env = "SSS_PUBLIC_URL")]
+        public_url: Option<String>,
     },
-    AdminKey {
-        #[arg(long)]
-        data_dir: PathBuf,
-    },
-    New(AuthArgs),
+    /// Create a project. Does not change the working directory or save credentials.
+    New(ProjectArgs),
+    /// List projects (shared authentication).
+    List,
+    /// Add or replace selected files.
     Upload {
         #[arg(required = true)]
         files: Vec<PathBuf>,
     },
+    /// Mirror a directory, including deletions.
     Sync {
-        #[arg(default_value = ".")]
         dir: PathBuf,
         #[arg(long)]
         dry_run: bool,
     },
-    Delete {
-        files: Vec<String>,
-    },
-    Config(AuthArgs),
-    Keys {
-        #[command(subcommand)]
-        command: KeyCommand,
+    /// Delete selected files, or the entire project when no files are specified.
+    Delete { files: Vec<String> },
+    /// Change project authentication (shared authentication).
+    Config(ProjectArgs),
+    /// List retained versions.
+    Versions,
+    /// Select a retained version as current.
+    Rollback { version: u64 },
+    /// Delete a retained version other than the current version.
+    DeleteVersion { version: u64 },
+    /// Install the latest verified release and refresh registered embedded skills.
+    Update {
+        #[arg(long)]
+        check: bool,
     },
 }
 #[derive(Args)]
-pub struct AuthArgs {
-    #[arg(long, num_args=0..=1, default_missing_value="", conflicts_with="no_basic_auth")]
-    pub basic_auth: Option<String>,
-    #[arg(long, conflicts_with = "no_basic_auth")]
-    pub password_stdin: bool,
+pub struct ProjectArgs {
     #[arg(long)]
-    pub no_basic_auth: bool,
-}
-#[derive(Subcommand)]
-pub enum KeyCommand {
-    Create {
-        #[arg(long, default_value = "upload,sync")]
-        scope: String,
-        #[arg(long)]
-        expires_in: Option<u64>,
-    },
-    List,
-    Revoke {
-        key_id: String,
-    },
+    pub name: Option<String>,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long = "basic_auth_view")]
+    pub view: Option<String>,
+    #[arg(long = "basic_auth_write")]
+    pub write: Option<String>,
 }
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    if cli.skill {
+        print!("{}", include_str!("../skill.md"));
+        return;
+    }
     let result = match &cli.command {
-        Command::Serve {
+        Some(Command::Serve {
             listen,
+            port,
             data_dir,
             public_url,
-        } => server::serve(listen, data_dir, public_url).await,
-        Command::AdminKey { data_dir } => server::admin_key(data_dir, cli.json),
-        _ => client::run(&cli).await,
+        }) => match data_dir.clone().map(Ok).unwrap_or_else(default_data_dir) {
+            Ok(root) => {
+                let url = public_url
+                    .clone()
+                    .unwrap_or_else(|| format!("http://localhost:{port}"));
+                server::serve(
+                    std::net::SocketAddr::new(*listen, *port),
+                    &root,
+                    &url,
+                    cli.basic_auth.as_deref(),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        },
+        Some(Command::Update { check }) => update::run(*check).await,
+        Some(_) => client::run(&cli).await,
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help().map_err(Into::into)
+        }
     };
     if let Err(e) = result {
-        eprintln!("error: {e:#}");
+        eprintln!("{}", serde_json::json!({"error":format!("{e:#}")}));
         std::process::exit(1);
     }
 }
-
+fn default_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("HOME is unset; provide --data-dir"))?,
+    )
+    .join(".sss"))
+}
 pub fn hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
@@ -100,12 +144,6 @@ pub fn id(bytes: usize) -> String {
     let mut data = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut data);
     hex::encode(data)
-}
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
 }
 pub fn valid_path(p: &str) -> bool {
     !p.is_empty()
@@ -120,4 +158,5 @@ pub fn valid_path(p: &str) -> bool {
                 && !x.ends_with(".pem")
                 && !x.ends_with(".key")
         })
+        && p.split('/').next() != Some("versions")
 }

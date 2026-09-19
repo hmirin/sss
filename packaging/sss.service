@@ -1,5 +1,5 @@
 [Unit]
-Description=Simple Serve System
+Description=Simple Static Site
 After=network.target
 
 [Service]
@@ -9,7 +9,7 @@ Group=sss
 StateDirectory=sss
 StateDirectoryMode=0700
 EnvironmentFile=/etc/sss/sss.env
-ExecStart=/usr/local/bin/sss serve --listen ${SSS_LISTEN} --data-dir /var/lib/sss --public-url ${SSS_PUBLIC_URL}
+ExecStart=/usr/local/bin/sss serve --data-dir /var/lib/sss
 Restart=on-failure
 RestartSec=3
 UMask=0077

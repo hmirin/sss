@@ -2,6 +2,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY skill.md ./skill.md
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
@@ -15,4 +16,5 @@ USER 10001:10001
 VOLUME ["/var/lib/sss"]
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/sss"]
-CMD ["serve", "--listen", "0.0.0.0:8080", "--data-dir", "/var/lib/sss", "--public-url", "http://localhost:8080"]
+ENV SSS_LISTEN=0.0.0.0 SSS_PORT=8080 SSS_DATA_DIR=/var/lib/sss
+CMD ["serve"]
