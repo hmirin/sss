@@ -1,5 +1,7 @@
 # sss — Simple Static Site
 
+**Publish what your agent builds.**
+
 A dead-simple static site server and publishing system for agent-based workflows.
 View artifacts created by Codex, Claude, or other agents from any computer or mobile device.
 
