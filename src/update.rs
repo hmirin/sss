@@ -153,17 +153,13 @@ fn install_binary(
             .set_permissions(fs::Permissions::from_mode(0o755))?;
     }
     let candidate = candidate.into_temp_path();
-    let output = std::process::Command::new(&candidate)
-        .arg("--version")
-        .output()?;
+    let output = candidate_output(&candidate, "--version")?;
     if !output.status.success()
         || String::from_utf8(output.stdout)?.trim() != format!("sss {version}")
     {
         bail!("release binary version mismatch")
     }
-    let skill = std::process::Command::new(&candidate)
-        .arg("--skill")
-        .output()?;
+    let skill = candidate_output(&candidate, "--skill")?;
     if !skill.status.success() {
         bail!("release binary could not emit its skill")
     }
@@ -209,6 +205,25 @@ fn install_binary(
         )
     }
     Ok(())
+}
+// A concurrent fork can briefly inherit a writable descriptor even after this
+// process closes it. Linux then rejects exec with ETXTBSY until that child execs.
+// Retry only that transient spawn error, never a failed candidate or verification.
+fn candidate_output(path: &Path, argument: &str) -> std::io::Result<std::process::Output> {
+    retry_text_busy(|| std::process::Command::new(path).arg(argument).output())
+}
+fn retry_text_busy<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for attempt in 0..10 {
+        match operation() {
+            Err(error)
+                if cfg!(target_os = "linux") && error.raw_os_error() == Some(26) && attempt < 9 =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
 }
 fn skill_paths() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -331,6 +346,37 @@ fn verified_binary(archive: &[u8], digest: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retries_only_transient_text_busy_with_a_bound() {
+        let mut attempts = 0;
+        let result = retry_text_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(26))
+            } else {
+                Ok("started")
+            }
+        });
+        assert_eq!(result.unwrap(), "started");
+        assert_eq!(attempts, 3);
+        let mut attempts = 0;
+        let error = retry_text_busy::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(26))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(26));
+        assert_eq!(attempts, 10);
+        let mut attempts = 0;
+        let error = retry_text_busy::<()>(|| {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(13))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(13));
+        assert_eq!(attempts, 1);
+    }
     #[test]
     fn rejects_untrusted_manifest() {
         assert!(verify_manifest("v0.2.0", b"fake", b"{}").is_err())
