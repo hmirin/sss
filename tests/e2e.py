@@ -109,6 +109,7 @@ def exercise(shared):
             (work / 'index.html').write_text('two')
             v2 = cli('upload', 'index.html', '--project', p)
             assert v2['version'] == 2
+            cli('sync', 'index.html', '--project', p, ok=False)
             assert request(f'/s/{p}/assets/style.css', credential=shared)[1] == b'body{}'
             assert request(f'/s/{p}/versions/1/', credential=shared)[1] == b'one'
             assert request(f'/s/{p}/', credential=shared)[1] == b'two'

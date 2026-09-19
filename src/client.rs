@@ -114,6 +114,9 @@ fn collect(root: &Path, inputs: &[PathBuf], directory: bool) -> Result<BTreeMap<
         Ok(())
     };
     if directory {
+        if !fs::symlink_metadata(root)?.is_dir() {
+            bail!("sync source must be a directory")
+        }
         if fs::symlink_metadata(root)?.file_type().is_symlink() {
             bail!("sync root must not be a symlink")
         };
