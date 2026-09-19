@@ -1,73 +1,99 @@
-# CLI reference
+# CLI Reference
 
-`sss` is a single executable containing a client and server. `sss --help` and subcommand `--help` show the installed command contract.
+All client commands return JSON. No client configuration file or login step is required.
 
-## Common options and credentials
+## Connection and Authentication
 
-| Option | Meaning |
-|---|---|
-| `--upstream URL` | Management server origin; otherwise use `.sss.json`. |
-| `--project ID` | Explicit project; otherwise use `.sss.json`. |
-| `--json` | Machine-readable JSON on standard output. |
-| `--allow-http` | Permit insecure HTTP to a non-loopback server; use only on an explicitly trusted transport. |
+| Option | Environment | Default |
+|---|---|---|
+| `--upstream URL` | `SSS_UPSTREAM` | `http://localhost:8080` |
+| `--basic_auth USER:PASS` | `SSS_BASIC_AUTH` | No credentials |
+| `--project ID` | — | Required for project operations |
 
-Client management commands read the bearer token from `SSS_API_KEY`. Do not put credentials in `.sss.json`, commit them, or upload them as site files. Administrator keys create projects and issue/revoke scoped keys. Scoped keys act only on their project and permitted operations.
+Flags override environment variables. Project selection is explicit and never follows the last-created project. Credentials are not saved. HTTP and HTTPS origins are supported; supply HTTPS when credentials cross a network.
 
-## Create and publish
-
-```sh
-sss new --upstream https://preview.example
-sss new --upstream https://preview.example --basic-auth
-sss new --upstream https://preview.example --basic-auth --password-stdin
-sss upload index.html assets/style.css
-sss sync . --dry-run
-sss sync ./dist
-```
-
-`new` creates a project, prints its stable `/s/{ID}/` URL, and writes `.sss.json` with its upstream and project ID. `upload` adds or replaces the selected files and preserves other remote files. Paths are relative site paths; use relative asset references in HTML as well.
-
-`sync DIR` makes the remote project match the included local directory contents. Files absent locally are removed remotely. `--dry-run` reports the comparison without uploading or deleting. `.sssignore` supplies additional ignore patterns. Hidden files/directories (including `.git`, `.env`, `.sss.json`, and `.sssignore`), `node_modules`, `target`, `.pem`, and `.key` files are excluded. Symlinks are not uploaded.
-
-Updates compare SHA-256 hashes, transfer changed files, and publish the prepared revision together. A stale revision is rejected instead of overwriting concurrent changes. This is an atomic server revision switch, not a browser-wide snapshot: requests straddling a deployment may see different revisions. Prefer content-hashed asset names where that matters.
-
-## Browsing passwords
+## Create and List
 
 ```sh
-sss config --basic-auth                 # Prompt without echo
-sss config --basic-auth --password-stdin
-sss config --no-basic-auth
+sss new --name hello
+sss list
+sss new --name public --basic_auth_view none --basic_auth_write none
+sss new --config project.json
+sss new --config -
 ```
 
-Basic authentication uses the fixed username `sss`. It covers HTML, assets, and missing paths within an existing protected project. Use HTTPS. An inline `--basic-auth PASSWORD` argument is supported but may expose the password in shell history or process listings; prefer the prompt or stdin.
+`new` returns `id` and `url`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omission means `inherit`. These set project policy. `--basic_auth` authenticates the request.
 
-## Delete
+JSON config accepts `name` and `auth.view` / `auth.write`. Each auth object has `mode: inherit`, `mode: none`, or `mode: basic` with `username` and `password`. Explicit flags override the corresponding JSON fields.
+
+Creation and listing use the server's shared authentication. An unset server credential leaves these operations open.
+
+## Publish
 
 ```sh
-sss delete old.html assets/old.css
-sss delete --project 6a91bd02c7ef
+sss upload index.html assets/style.css --project ID
+sss sync ./public --project ID --dry-run
+sss sync ./public --project ID
+sss delete old.html --project ID
 ```
 
-With file arguments, delete only those files. With no files, delete the entire project and its scoped keys. These are immediate mutations; there is no trash or rollback command.
+`upload` adds/replaces relative paths from the working directory; `sync` mirrors a directory including deletions. File deletion publishes a new snapshot. SHA-256 comparison avoids resending unchanged content. A no-op upload/sync returns `unchanged: true` and keeps the current version; an initial empty sync creates version 1.
 
-## API keys
+Dry-run returns `added`, `modified`, and `deleted` paths without creating a version. Publication returns `project`, `version`, `revision`, `url`, and `version_url`.
+
+`.sssignore` follows gitignore syntax. Hidden paths, `node_modules`, `target`, `.pem`, and `.key` files are excluded. Symlinks are rejected. The top-level `versions/` path is reserved. Use relative asset URLs.
+
+Limits per snapshot: 50 MiB decoded content, 5,000 files, 1,024 bytes per relative UTF-8 path. HTTP request limit: 72 MiB. Retained versions consume disk until explicitly deleted.
+
+## Versions and Deletion
 
 ```sh
-sss keys create --project 6a91bd02c7ef --scope upload,sync --expires-in 86400
-sss keys list
-sss keys revoke KEY_ID
+sss versions --project ID
+sss rollback 1 --project ID
+sss delete-version 2 --project ID
+sss delete --project ID
 ```
 
-`--scope` is a comma-separated subset of `upload,sync,delete,config`; default `upload,sync`. `--expires-in` is lifetime in seconds; omission means no expiry. A key is returned only at creation; list returns metadata, not key material. Upload/sync/delete scopes include the manifest access those operations need. `delete` permits whole-project deletion as well as file deletion. Scoped keys cannot create projects or issue keys.
+Versions are increasing integers starting at 1 and are never reused. Rollback changes the current version and concurrency token. The current version cannot be deleted. Whole-project deletion removes all versions and access settings.
 
-## Server administration
+Every snapshot uses current project authentication. Publication is atomic on the server; separate browser requests spanning an update can still observe different versions. Use a fixed version URL when you need a stable snapshot.
+
+## Change Authentication
 
 ```sh
-sss admin-key --data-dir /var/lib/sss
-sss admin-key --data-dir /var/lib/sss --json
-sss serve --listen 127.0.0.1:8080 --data-dir /var/lib/sss \
-  --public-url https://preview.example
+sss config --project ID --basic_auth_view none
+sss config --project ID --basic_auth_write inherit
+sss config --project ID --config project-auth.json
 ```
 
-`admin-key` creates an additional administrator key in the local data directory and emits its secret once. It requires filesystem access, not an existing API key. Secure the data directory and capture the token privately. `serve` uses the same directory and does not print API credentials. `--public-url` must be an HTTP(S) origin, without a path, credentials, query, or fragment. `--listen` defaults to `127.0.0.1:8080`.
+The JSON object contains `auth` just as on creation. Only supplied fields change. This command requires shared server credentials when configured; project editing credentials do not authorize it. Renaming is not part of `config`.
 
-Limits: 50 MiB of decoded file contents and 5,000 files per project; 72 MiB per HTTP request. Paths must be nonempty relative UTF-8 paths, at most 1,024 bytes, with no empty, `.` or `..` components, backslashes, colons, NULs, or excluded components.
+## Server
+
+```sh
+sss serve
+sss serve --listen 127.0.0.1 --port 8080 --data-dir /var/lib/sss --public-url https://sss.example
+```
+
+| Option | Environment | Default |
+|---|---|---|
+| `--listen` | `SSS_LISTEN` | `127.0.0.1` |
+| `--port` | `SSS_PORT` | `8080` |
+| `--data-dir` | `SSS_DATA_DIR` | `~/.sss` |
+| `--public-url` | `SSS_PUBLIC_URL` | `http://localhost:<port>` |
+
+`SSS_BASIC_AUTH` configures shared server authentication. It covers administration and inherited project access. Explicit project `none` and `basic` override inheritance. Shared credentials retain access to all projects. Only hashes of project passwords are stored; server environment credentials are hashed in memory.
+
+## Embedded Skill and Update
+
+```sh
+sss --skill
+sss update --check
+sss update
+```
+
+`--skill` prints the bundled skill and requires no server. `update` fetches the latest stable GitHub release for the current target, verifies its attested checksum manifest and archive, checks the new executable, and atomically replaces the binary. It does not execute a downloaded installer script.
+
+Unmodified registered sss skills under `~/.agents`, `~/.claude`, and `CODEX_HOME` (default `~/.codex`) are refreshed from the new binary. Modified skills are preserved and reported. Custom paths require manual refresh. `--check` makes no local changes. `GH_TOKEN` is supported for private GitHub release access and is distinct from server Basic authentication.
+
+A server already running continues to use its old executable until restarted. Signature, download, extraction, or candidate verification failures leave the installed binary unchanged. Skill replacement failures after a binary update are reported separately.
