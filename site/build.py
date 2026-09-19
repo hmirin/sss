@@ -6,6 +6,8 @@ out = root / "site" / "dist"
 out.mkdir(exist_ok=True)
 for name in ("index.html", "style.css", "script.js"):
     shutil.copyfile(root / "site" / name, out / name)
-for name in ("README.md", "installation.md", "skill.md"):
+for stale in ("README.md", "skill.md"):
+    (out / stale).unlink(missing_ok=True)
+for name in ("installation.md",):
     shutil.copyfile(root / name, out / name)
 print(out)
