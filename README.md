@@ -68,6 +68,32 @@ sss sync ./public --upstream https://somewhere --project a1b2c3
 
 `--upstream` takes precedence over `SSS_UPSTREAM`. Neither is required for local use.
 
+## Listing and Deleting Projects
+
+List projects on the selected server:
+
+```sh
+sss list
+```
+
+Use a project's ID from the JSON response with `--project`.
+
+Delete a project, including all its files, versions, and access settings:
+
+```sh
+sss delete --project a1b2c3
+```
+
+To delete only selected files, specify their paths:
+
+```sh
+sss delete old.html assets/old.css --project a1b2c3
+```
+
+File deletion publishes a new version; previous versions remain available. Whole-project deletion cannot be undone through sss.
+
+When authentication is enabled, listing uses the server's shared credentials and deletion requires project editing access. Supply credentials with `--basic_auth` or `SSS_BASIC_AUTH`.
+
 ## Uploading Files
 
 `sync` makes the project match the directory, including removing files that are no longer present. Preview the changes with `--dry-run`. Use `upload` to add or replace files without removing other files:
