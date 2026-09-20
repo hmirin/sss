@@ -36,13 +36,25 @@ sss new --name hello
 }
 ```
 
-Publish a directory:
+Create a file and publish it, using the project ID returned above:
 
 ```sh
+mkdir -p public
+echo hello > public/index.html
 sss sync ./public --project a1b2c3
 ```
 
-Open the returned project URL. Run the same sync command whenever you want to publish an update.
+Fetch the published page:
+
+```sh
+curl http://localhost:8080/s/a1b2c3/
+```
+
+```text
+hello
+```
+
+You can also open the URL in a browser. Run the same sync command whenever you want to publish an update.
 
 > [!WARNING]
 > Use relative asset paths such as `assets/style.css`, not `/assets/style.css`, so pages work under both project and version URLs.
