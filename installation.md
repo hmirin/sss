@@ -23,17 +23,7 @@ Explain that without shared server authentication, anyone who can reach the serv
 Follow these steps on each machine that needs sss.
 
 1. Check whether `sss` is already on `PATH`. If it is, inspect `sss --version` and keep it unless the user asked for an update. Use `sss update` for an existing installation.
-2. Detect the operating system and CPU architecture. Download the matching binary from the [GitHub releases](https://github.com/hmirin/sss/releases), using the latest stable release unless a version was requested. Inspect the release assets rather than constructing an asset filename. Download the matching `.sigstore.json` attestation bundle and verify the archive's provenance before extracting or running it. Use GitHub CLI with the selected release tag (shown here as `$tag`) and downloaded archive (`$archive`):
-
-   ```sh
-   gh attestation verify "$archive" \
-     --bundle "$archive.sigstore.json" \
-     --repo hmirin/sss \
-     --cert-identity "https://github.com/hmirin/sss/.github/workflows/release.yml@refs/tags/$tag" \
-     --source-ref "refs/tags/$tag"
-   ```
-
-   Also compare the archive against the release's published checksum. Stop if verification fails; do not install an unverified release.
+2. Detect the operating system and CPU architecture. Download the matching archive from the [GitHub releases](https://github.com/hmirin/sss/releases), using the latest stable release unless a version was requested. Inspect the release assets rather than constructing an asset filename. Extract the archive to obtain `sss`.
 3. Install `sss` into an existing user-writable directory on `PATH`, or use `~/.local/bin`. If necessary, add that directory to the user's shell configuration without duplicating an existing entry.
 
 If a matching binary is unavailable, build from source with Rust and Cargo:
@@ -47,6 +37,20 @@ install -m 755 target/release/sss ~/.local/bin/sss
 ```
 
 Use the requested release tag when building a specific version. If the repository or release cannot be accessed, report the missing access rather than downloading from another source.
+
+## Verify Release Provenance (Optional)
+
+To verify how the release was built, download the archive's matching `.sigstore.json` attestation bundle and run the following before extracting or running the binary. Set `$tag` to the selected release tag and `$archive` to the downloaded archive path:
+
+```sh
+gh attestation verify "$archive" \
+  --bundle "$archive.sigstore.json" \
+  --repo hmirin/sss \
+  --cert-identity "https://github.com/hmirin/sss/.github/workflows/release.yml@refs/tags/$tag" \
+  --source-ref "refs/tags/$tag"
+```
+
+You can also compare the archive against the release's published checksum. If you choose to verify the release and a check fails, stop and investigate before installing.
 
 ## Register the Agent Skill
 
