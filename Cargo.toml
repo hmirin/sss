@@ -2,7 +2,7 @@
 name = "sss"
 version = "0.1.0"
 edition = "2021"
-description = "Simple Static Site: atomic static publishing in one binary"
+description = "Simple Static Server: atomic static publishing in one binary"
 license = "MIT"
 
 [dependencies]

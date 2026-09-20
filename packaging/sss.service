@@ -1,5 +1,5 @@
 [Unit]
-Description=Simple Static Site
+Description=Simple Static Server
 After=network.target
 
 [Service]

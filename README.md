@@ -1,4 +1,4 @@
-# sss — Simple Static Site
+# sss — Simple Static Server
 
 **Publish what your agent builds.**
 

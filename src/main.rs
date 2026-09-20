@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Simple Static Site: publish static files from any machine",
+    about = "Simple Static Server: publish static files from any machine",
     subcommand_required = false
 )]
 pub struct Cli {
