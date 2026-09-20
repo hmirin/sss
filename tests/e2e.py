@@ -200,6 +200,8 @@ def exercise(shared):
 if __name__ == '__main__':
     exercise(None)
     exercise('admin:shared-password')
+    from features import exercise_features
+    exercise_features(BINARY)
     skill = subprocess.check_output([BINARY, '--skill'], text=True)
     assert skill.startswith('---\nname: sss\n')
     assert 'SSS_API_KEY' not in skill

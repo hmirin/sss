@@ -27,6 +27,7 @@ struct Store {
     root: PathBuf,
     public_url: String,
     admin: Option<StoredRule>,
+    default_lifetime: Option<i64>,
 }
 type Shared = Arc<Mutex<Store>>;
 struct ApiError(StatusCode, String);
@@ -80,6 +81,7 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS versions(project TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,number INTEGER NOT NULL,PRIMARY KEY(project,number)); PRAGMA user_version=2;")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS expirations(project TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS expiration_time ON expirations(expires_at);")?;
     let admin = credential
         .map(|v| {
             let (u, p) = crate::auth::split(v)?;
@@ -95,6 +97,7 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
         root: root.into(),
         public_url: url.trim_end_matches('/').into(),
         admin,
+        default_lifetime: None,
     })
 }
 struct Project {
@@ -103,8 +106,20 @@ struct Project {
     current: u64,
     next: u64,
     access: StoredAccess,
+    expires_at: Option<i64>,
 }
 fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
+    let expires_at: Option<i64> =
+        s.db.query_row(
+            "SELECT expires_at FROM expirations WHERE project=?1",
+            [p],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(anyhow::Error::from)?;
+    if expires_at.is_some_and(|t| t <= crate::expiry::now()) {
+        return Err(missing());
+    }
     let row =
         s.db.query_row(
             "SELECT name,revision,current,next,auth FROM projects WHERE id=?1",
@@ -123,6 +138,7 @@ fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
         .map_err(anyhow::Error::from)?
         .ok_or_else(missing)?;
     Ok(Project {
+        expires_at,
         name: row.0,
         revision: row.1,
         current: row.2,
@@ -180,14 +196,20 @@ struct NewProject {
     name: String,
     #[serde(default)]
     auth: Access,
+    expires_in: Option<String>,
 }
 async fn new_project(
     State(state): State<Shared>,
     h: HeaderMap,
     Json(body): Json<NewProject>,
 ) -> ApiResult {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
+    let lifetime = match &body.expires_in {
+        Some(v) => crate::expiry::duration(v).map_err(|_| bad("invalid expires_in"))?,
+        None => s.default_lifetime,
+    };
+    let expires_at = crate::expiry::deadline(lifetime).map_err(|_| bad("expiration too large"))?;
     if body.name.len() > 256 {
         return Err(bad("name too long"));
     }
@@ -197,7 +219,8 @@ async fn new_project(
         .map_err(|_| bad("invalid authentication settings"))?;
     let p = id(6);
     let rev = id(12);
-    s.db.execute(
+    let tx = s.db.transaction().map_err(anyhow::Error::from)?;
+    tx.execute(
         "INSERT INTO projects(id,name,revision,auth) VALUES(?1,?2,?3,?4)",
         params![
             p,
@@ -207,21 +230,29 @@ async fn new_project(
         ],
     )
     .map_err(anyhow::Error::from)?;
+    if let Some(t) = expires_at {
+        tx.execute(
+            "INSERT INTO expirations(project,expires_at) VALUES(?1,?2)",
+            params![p, t],
+        )
+        .map_err(anyhow::Error::from)?;
+    }
+    tx.commit().map_err(anyhow::Error::from)?;
     Ok(Json(
-        json!({"id":p,"url":format!("{}/s/{p}/",s.public_url)}),
+        json!({"id":p,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expires_at}),
     ))
 }
 async fn list_projects(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
     let mut q =
-        s.db.prepare("SELECT id,name,current FROM projects ORDER BY id")
+        s.db.prepare("SELECT id,name,current,(SELECT expires_at FROM expirations WHERE project=id) FROM projects WHERE id NOT IN (SELECT project FROM expirations WHERE expires_at <= unixepoch()) ORDER BY id")
             .map_err(anyhow::Error::from)?;
-    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"version":r.get::<_,u64>(2)?}))).map_err(anyhow::Error::from)?.collect::<std::result::Result<Vec<_>,_>>().map_err(anyhow::Error::from)?;
+    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"version":r.get::<_,u64>(2)?,"expires_at":r.get::<_,Option<i64>>(3)?}))).map_err(anyhow::Error::from)?.collect::<std::result::Result<Vec<_>,_>>().map_err(anyhow::Error::from)?;
     Ok(Json(json!({"projects":rows})))
 }
 fn summary(s: &Store, p: &str, row: &Project) -> Value {
-    json!({"project":p,"name":row.name,"revision":row.revision,"version":row.current,"url":format!("{}/s/{p}/",s.public_url),"version_url":if row.current==0 {Value::Null}else{json!(format!("{}/s/{p}/versions/{}/",s.public_url,row.current))}})
+    json!({"project":p,"expires_at":row.expires_at,"name":row.name,"revision":row.revision,"version":row.current,"url":format!("{}/s/{p}/",s.public_url),"version_url":if row.current==0 {Value::Null}else{json!(format!("{}/s/{p}/versions/{}/",s.public_url,row.current))}})
 }
 async fn manifest(State(state): State<Shared>, Path(p): Path<String>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
@@ -421,33 +452,163 @@ struct PatchAccess {
     view: Option<Rule>,
     write: Option<Rule>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchProject {
+    name: Option<String>,
+    auth: Option<PatchAccess>,
+    expires_in: Option<String>,
+}
 async fn config(
     State(state): State<Shared>,
     Path(p): Path<String>,
     h: HeaderMap,
-    Json(body): Json<PatchAccess>,
+    Json(body): Json<PatchProject>,
 ) -> ApiResult {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
-    let mut access = project(&s, &p)?.access;
-    if body.view.is_none() && body.write.is_none() {
-        return Err(bad("specify view or write"));
+    let row = project(&s, &p)?;
+    if body.name.is_none() && body.auth.is_none() && body.expires_in.is_none() {
+        return Err(bad("specify name, auth, or expires_in"));
     }
-    if let Some(v) = body.view {
-        access.view = v.store().map_err(|_| bad("invalid view authentication"))?
+    let mut access = row.access;
+    if let Some(a) = body.auth {
+        if let Some(v) = a.view {
+            access.view = v.store().map_err(|_| bad("invalid view authentication"))?;
+        }
+        if let Some(v) = a.write {
+            access.write = v.store().map_err(|_| bad("invalid write authentication"))?;
+        }
     }
-    if let Some(v) = body.write {
-        access.write = v.store().map_err(|_| bad("invalid write authentication"))?
+    let name = body.name.unwrap_or(row.name);
+    if name.len() > 256 {
+        return Err(bad("name too long"));
     }
-    s.db.execute(
-        "UPDATE projects SET auth=?1 WHERE id=?2",
+    let expires_at = match &body.expires_in {
+        None => row.expires_at,
+        Some(v) => crate::expiry::deadline(
+            crate::expiry::duration(v).map_err(|_| bad("invalid expires_in"))?,
+        )
+        .map_err(|_| bad("expiration too large"))?,
+    };
+    let tx = s.db.transaction().map_err(anyhow::Error::from)?;
+    tx.execute(
+        "UPDATE projects SET name=?1,auth=?2 WHERE id=?3",
         params![
+            name,
             serde_json::to_string(&access).map_err(anyhow::Error::from)?,
             p
         ],
     )
     .map_err(anyhow::Error::from)?;
-    Ok(Json(json!({"project":p,"updated":true})))
+    tx.execute("DELETE FROM expirations WHERE project=?1", [&p])
+        .map_err(anyhow::Error::from)?;
+    if let Some(t) = expires_at {
+        tx.execute(
+            "INSERT INTO expirations(project,expires_at) VALUES(?1,?2)",
+            params![p, t],
+        )
+        .map_err(anyhow::Error::from)?;
+    }
+    tx.commit().map_err(anyhow::Error::from)?;
+    Ok(Json(
+        json!({"project":p,"updated":true,"expires_at":expires_at}),
+    ))
+}
+fn access_summary(rule: &StoredRule, admin: bool) -> Value {
+    match rule {
+        StoredRule::Inherit => json!({"mode":"inherit","authentication_required":admin}),
+        StoredRule::None => json!({"mode":"none","authentication_required":false}),
+        StoredRule::Basic { username, .. } => {
+            json!({"mode":"basic","username":username,"authentication_required":true})
+        }
+    }
+}
+async fn info(State(state): State<Shared>, Path(p): Path<String>, h: HeaderMap) -> ApiResult {
+    let s = state.lock().unwrap();
+    auth(&s, &h, Some(&p), "write")?;
+    let row = project(&s, &p)?;
+    let mut result = summary(&s, &p, &row);
+    let mut total_bytes = 0u64;
+    let mut current_bytes = 0u64;
+    let mut current_files = 0u64;
+    let root = s.root.join("projects").join(&p);
+    if root.exists() {
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let e = entry.map_err(anyhow::Error::from)?;
+            if e.file_type().is_file() {
+                let size = e.metadata().map_err(anyhow::Error::from)?.len();
+                total_bytes += size;
+                if e.path().starts_with(root.join(row.current.to_string())) {
+                    current_bytes += size;
+                    current_files += 1;
+                }
+            }
+        }
+    }
+    result["files"] = json!(current_files);
+    result["bytes"] = json!(current_bytes);
+    result["storage_bytes"] = json!(total_bytes);
+    result["auth"] = json!({"view":access_summary(&row.access.view,s.admin.is_some()),"write":access_summary(&row.access.write,s.admin.is_some())});
+    Ok(Json(result))
+}
+async fn status(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
+    let s = state.lock().unwrap();
+    auth(&s, &h, None, "admin")?;
+    Ok(Json(
+        json!({"version":env!("CARGO_PKG_VERSION"),"authentication_required":s.admin.is_some(),"default_expires_in_seconds":s.default_lifetime}),
+    ))
+}
+async fn snapshot_file(
+    State(state): State<Shared>,
+    Path((p, n, path)): Path<(String, u64, String)>,
+    h: HeaderMap,
+) -> Result<Response, ApiError> {
+    let s = state.lock().unwrap();
+    auth(&s, &h, Some(&p), "write")?;
+    project(&s, &p)?;
+    has_version(&s, &p, n)?;
+    if !valid_path(&path) {
+        return Err(bad("unsafe path"));
+    }
+    let root = s.root.join("projects").join(&p).join(n.to_string());
+    let mut full = root;
+    for part in path.split('/') {
+        full.push(part);
+        if fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(missing());
+        }
+    }
+    let bytes = fs::read(full).map_err(|_| missing())?;
+    Ok((
+        [
+            ("content-type", "application/octet-stream"),
+            ("cache-control", "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+fn purge_expired(s: &Store) -> Result<()> {
+    let mut q =
+        s.db.prepare("SELECT project FROM expirations WHERE expires_at <= ?1")?;
+    let ids = q
+        .query_map([crate::expiry::now()], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for p in ids {
+        let result = (|| -> Result<()> {
+            let root = s.root.join("projects").join(&p);
+            if root.exists() {
+                fs::remove_dir_all(root)?;
+            }
+            s.db.execute("DELETE FROM projects WHERE id=?1", [&p])?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("expiry cleanup failed for {p}; will retry: {e}");
+        }
+    }
+    Ok(())
 }
 async fn versions(State(state): State<Shared>, Path(p): Path<String>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
@@ -607,6 +768,7 @@ pub async fn serve(
     root: &FsPath,
     url: &str,
     credential: Option<&str>,
+    default_expires_in: &str,
 ) -> Result<()> {
     let parsed = url::Url::parse(url)?;
     if !matches!(parsed.scheme(), "http" | "https")
@@ -628,7 +790,9 @@ pub async fn serve(
         .open(root.join("serve.lock"))?;
     fs2::FileExt::try_lock_exclusive(&lock)
         .context("another sss server is using this data directory")?;
-    let store = open(root, url, credential)?;
+    let mut store = open(root, url, credential)?;
+    store.default_lifetime = crate::expiry::duration(default_expires_in)?;
+    purge_expired(&store)?;
     // Only remove uncommitted or deleted versions; retained snapshots survive restarts.
     for entry in fs::read_dir(root.join("projects"))? {
         let entry = entry?;
@@ -650,22 +814,47 @@ pub async fn serve(
                 fs::remove_dir_all(release.path())?
             }
         }
-        if project(&store, &name).is_err() {
+        let exists: bool = store.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+            [&name],
+            |r| r.get(0),
+        )?;
+        if !exists {
             fs::remove_dir(entry.path())?
         }
     }
     let state = Arc::new(Mutex::new(store));
+    let cleanup = state.clone();
+    let janitor = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(e) = purge_expired(&cleanup.lock().unwrap()) {
+                eprintln!("expiry cleanup failed: {e}");
+            }
+        }
+    });
     let permits = Arc::new(tokio::sync::Semaphore::new(2));
     let app = Router::new()
-        .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
+        .route(
+            "/health",
+            get(|| async { Json(json!({"status":"ok","version":env!("CARGO_PKG_VERSION")})) }),
+        )
+        .route("/api/status", get(status))
         .route("/api/projects", post(new_project).get(list_projects))
-        .route("/api/projects/{p}", get(manifest).delete(delete_project))
-        .route("/api/projects/{p}/auth", axum::routing::patch(config))
+        .route(
+            "/api/projects/{p}",
+            get(info).patch(config).delete(delete_project),
+        )
         .route("/api/projects/{p}/manifest", get(manifest))
         .route("/api/projects/{p}/versions", get(versions).post(update))
         .route(
             "/api/projects/{p}/versions/{n}",
             axum::routing::delete(delete_version),
+        )
+        .route(
+            "/api/projects/{p}/versions/{n}/files/{*path}",
+            get(snapshot_file),
         )
         .route("/api/projects/{p}/current", axum::routing::put(rollback))
         .route("/s/{p}/", get(static_root))
@@ -691,5 +880,6 @@ pub async fn serve(
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    janitor.abort();
     Ok(())
 }

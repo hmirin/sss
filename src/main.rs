@@ -1,5 +1,6 @@
 mod auth;
 mod client;
+mod expiry;
 mod server;
 mod update;
 use clap::{Args, Parser, Subcommand};
@@ -45,11 +46,20 @@ pub enum Command {
         data_dir: Option<PathBuf>,
         #[arg(long, env = "SSS_PUBLIC_URL")]
         public_url: Option<String>,
+        /// Default lifetime for new projects (e.g. 7d, 12h, or none).
+        #[arg(long, env = "SSS_DEFAULT_EXPIRES_IN", default_value = "none")]
+        default_expires_in: String,
     },
     /// Create a project. Does not change the working directory or save credentials.
     New(ProjectArgs),
     /// List projects (shared authentication).
     List,
+    /// Show project URLs, storage usage, access rules, and expiration.
+    Info,
+    /// Diagnose server connectivity and authentication.
+    Doctor,
+    /// Compare local files with the published snapshot without changing it.
+    Diff { dir: PathBuf },
     /// Add or replace selected files.
     Upload {
         #[arg(required = true)]
@@ -60,10 +70,13 @@ pub enum Command {
         dir: PathBuf,
         #[arg(long)]
         dry_run: bool,
+        /// Publish after changes settle; Ctrl-C stops watching.
+        #[arg(long, conflicts_with = "dry_run")]
+        watch: bool,
     },
     /// Delete selected files, or the entire project when no files are specified.
     Delete { files: Vec<String> },
-    /// Change project authentication (shared authentication).
+    /// Change project name, authentication, or expiration (shared authentication).
     Config(ProjectArgs),
     /// List retained versions.
     Versions,
@@ -81,6 +94,9 @@ pub enum Command {
 pub struct ProjectArgs {
     #[arg(long)]
     pub name: Option<String>,
+    /// Lifetime from now (e.g. 7d, 12h, or none to disable expiry).
+    #[arg(long)]
+    pub expires_in: Option<String>,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long = "basic_auth_view")]
@@ -101,6 +117,7 @@ async fn main() {
             port,
             data_dir,
             public_url,
+            default_expires_in,
         }) => match data_dir.clone().map(Ok).unwrap_or_else(default_data_dir) {
             Ok(root) => {
                 let url = public_url
@@ -111,6 +128,7 @@ async fn main() {
                     &root,
                     &url,
                     cli.basic_auth.as_deref(),
+                    default_expires_in,
                 )
                 .await
             }

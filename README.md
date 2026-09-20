@@ -172,6 +172,55 @@ Rollback changes which version the project URL serves. It does not rewrite an ex
 
 All versions use the project's current authentication settings. Changing a password also changes access to older versions.
 
+## Inspect and Diagnose
+
+```sh
+sss info --project a1b2c3
+sss doctor
+sss doctor --project a1b2c3
+sss diff ./public --project a1b2c3
+```
+
+`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
+
+`doctor` reports the selected upstream, client/server versions, reachability, and authentication checks as JSON. Without a project it checks shared administration access; with `--project` it checks editing access to that project. It makes no changes and exits nonzero when a check fails.
+
+`diff` compares local files with the current published snapshot without publishing. Its JSON includes added, modified, and deleted paths and unified text patches. Binary/non-UTF-8 files and file pairs larger than 1 MiB report sizes with `content_omitted: true`. It uses editing credentials even when viewing has a separate password. If the published revision changes during comparison, retry the command.
+
+## Watch a Directory
+
+```sh
+sss sync ./public --project a1b2c3 --watch
+```
+
+Publish once, then watch for local changes until Ctrl-C. Changes are polled every 250 ms and published after 750 ms of quiet, grouping bursts into one version. Existing exclusions and `.sssignore` apply. Identical content does not create a version. Each publication prints one JSON object on its own line; diagnostics go to stderr. `--watch` cannot be combined with `--dry-run`.
+
+An unreadable or missing source directory is not published; watching resumes when it can be read. A server error or revision conflict stops the watcher so you can inspect the problem before retrying. Watch keeps the local directory authoritative when publishing a new batch; coordinate with other editors of the same project.
+
+## Project Expiration
+
+Choose a default lifetime for newly created projects on the server:
+
+```sh
+sss serve --default-expires-in 7d
+# Or set SSS_DEFAULT_EXPIRES_IN=7d in the server environment.
+```
+
+Override it when creating a project, or change it with the same `config` command used for authentication:
+
+```sh
+sss new --name preview --expires-in 1d
+sss config --project a1b2c3 --expires-in 30d
+sss config --project a1b2c3 --expires-in none
+sss config --project a1b2c3 --name hello --basic_auth_view none --expires-in 7d
+```
+
+Durations are positive whole numbers with `s`, `m`, `h`, `d`, or `w`; `none` disables expiration. JSON configuration accepts `"expires_in": "7d"` or `"expires_in": "none"`; CLI flags override JSON values.
+
+The lifetime starts at creation or when explicitly changed. Uploads, syncs, and rollbacks do not extend it. Omitting the setting on `new` uses the server default (which is `none` unless configured); omitting it on `config` preserves the existing deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
+
+**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived by extending their deadline. Use `info` or `list` to inspect deadlines before they expire.
+
 ## Authentication (Optional)
 
 By default, no authentication is required. Anyone who can reach the server can create, edit, and delete projects.
@@ -183,7 +232,7 @@ export SSS_BASIC_AUTH='user:example-password'
 sss serve
 ```
 
-This shared credential protects project creation, global listing, authentication changes, and, by default, all project viewing and editing. It can administer every project. If `SSS_BASIC_AUTH` is unset, server-wide operations require no authentication and projects inherit that default.
+This shared credential protects project creation, global listing, project settings changes, and, by default, all project viewing and editing. It can administer every project. If `SSS_BASIC_AUTH` is unset, server-wide operations require no authentication and projects inherit that default.
 
 Projects inherit this authentication by default. You can override viewing and editing access for individual projects.
 
@@ -255,7 +304,7 @@ Explicit `--basic_auth_view` and `--basic_auth_write` options override the corre
 
 Both viewing and editing support all three modes. Project-specific credentials authorize only the configured operation on that project; they do not grant server-wide administration. The server's shared credential retains access to every project, including projects with overrides.
 
-Creating projects, listing all projects, and changing authentication settings use the server's shared authentication. If it is unset, those operations remain unauthenticated even when a project has its own password. Set `SSS_BASIC_AUTH` on the server if you need to protect those operations.
+Creating projects, listing all projects, and changing project settings use the server's shared authentication. If it is unset, those operations remain unauthenticated even when a project has its own password. Set `SSS_BASIC_AUTH` on the server if you need to protect those operations.
 
 Keep configuration files containing passwords out of repositories and published directories. Use `--config -` to read JSON from standard input instead of a file. Server-side passwords are stored as hashes.
 

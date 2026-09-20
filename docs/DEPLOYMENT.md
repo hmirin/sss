@@ -14,6 +14,10 @@ SSS_PUBLIC_URL=https://sss.example
 
 Optionally add `SSS_BASIC_AUTH=user:password`; restrict the environment file to its administrator. The unit sets `--data-dir /var/lib/sss` and runs as the `sss` user. Do not expose or commit credentials.
 
+## Default Project Lifetime
+
+Set `SSS_DEFAULT_EXPIRES_IN=7d` (or `--default-expires-in 7d`) to give new projects a default expiration. The default is `none`. Projects can override it on creation and administrators can change or remove deadlines with `sss config --expires-in`. Existing project deadlines are unaffected by server default changes. Expired projects become inaccessible immediately; all snapshots and metadata are deleted on startup or a 30-second cleanup pass.
+
 ## Docker
 
 ```sh
@@ -27,7 +31,7 @@ The image binds to `0.0.0.0:8080` inside the container. Set `SSS_PUBLIC_URL` to 
 
 SQLite records project policy, current version, the next version number, and retained snapshots. Version files live below `projects/<id>/<number>/`. A data-directory lock prevents two servers from sharing a store. Startup removes uncommitted snapshot directories while keeping all retained versions.
 
-Back up the entire data directory while the service is stopped. Restore it with its original permissions. Retention is explicit: delete obsolete versions to reclaim disk. Current versions cannot be deleted.
+Back up the entire data directory while the service is stopped. Restore it with its original permissions. Retention is explicit: delete obsolete versions to reclaim disk, or configure project expiration. Current versions cannot be deleted.
 
 The API-key prototype uses a different data format. This version requires a fresh directory; it refuses the old format without migrating or deleting its contents.
 

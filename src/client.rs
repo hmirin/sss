@@ -52,6 +52,10 @@ fn project_body(args: &ProjectArgs) -> Result<Value> {
     if !body.is_object() {
         bail!("project config must be an object")
     }
+    if let Some(value) = &args.expires_in {
+        crate::expiry::duration(value)?;
+        body["expires_in"] = json!(value);
+    }
     if let Some(name) = &args.name {
         body["name"] = json!(name)
     }
@@ -192,7 +196,14 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let client = Client {
         http: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(
+                if matches!(cli.command, Some(Command::Doctor)) {
+                    15
+                } else {
+                    120
+                },
+            ))
             .build()?,
         upstream: cli.upstream.trim_end_matches('/').into(),
         credential: cli.basic_auth.clone(),
@@ -211,6 +222,13 @@ pub async fn run(cli: &Cli) -> Result<()> {
                 .await?
         }
         Command::List => client.call(Method::GET, "/api/projects", None).await?,
+        Command::Info => {
+            client
+                .call(Method::GET, &format!("/api/projects/{}", p()?), None)
+                .await?
+        }
+        Command::Doctor => return doctor(&client, project).await,
+        Command::Diff { dir } => diff(&client, p()?, collect(dir, &[], true)?).await?,
         Command::Upload { files } => {
             publish(
                 &client,
@@ -221,7 +239,14 @@ pub async fn run(cli: &Cli) -> Result<()> {
             )
             .await?
         }
-        Command::Sync { dir, dry_run } => {
+        Command::Sync {
+            dir,
+            dry_run,
+            watch,
+        } => {
+            if *watch {
+                return watch_directory(&client, p()?, dir).await;
+            }
             publish(&client, p()?, collect(dir, &[], true)?, true, *dry_run).await?
         }
         Command::Delete { files } => {
@@ -250,18 +275,11 @@ pub async fn run(cli: &Cli) -> Result<()> {
         }
         Command::Config(a) => {
             let body = project_body(a)?;
-            if body.get("name").is_some() {
-                bail!("config changes authentication only")
-            }
-            let access = body
-                .get("auth")
-                .context("specify --basic_auth_view, --basic_auth_write, or an auth config")?
-                .clone();
             client
                 .call(
                     Method::PATCH,
-                    &format!("/api/projects/{}/auth", p()?),
-                    Some(access),
+                    &format!("/api/projects/{}", p()?),
+                    Some(body),
                 )
                 .await?
         }
@@ -354,9 +372,200 @@ async fn publish(
     )
     .await
 }
+async fn doctor(c: &Client, project: Option<&str>) -> Result<()> {
+    let health = c.call(Method::GET, "/health", None).await;
+    let mut report = json!({"upstream":c.upstream,"client_version":env!("CARGO_PKG_VERSION"),"credentials_supplied":c.credential.is_some(),"checks":{}});
+    let reachable = health.is_ok();
+    report["checks"]["health"] = match health {
+        Ok(v) => json!({"ok":true,"response":v}),
+        Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
+    };
+    let mut authorized = false;
+    if reachable {
+        let path = project
+            .map(|p| format!("/api/projects/{p}"))
+            .unwrap_or_else(|| "/api/status".into());
+        let check = c.call(Method::GET, &path, None).await;
+        authorized = check.is_ok();
+        report["checks"][if project.is_some() {
+            "project_edit_access"
+        } else {
+            "server_admin_access"
+        }] = match check {
+            Ok(v) => json!({"ok":true,"response":v}),
+            Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
+        };
+    }
+    report["ok"] = json!(reachable && authorized);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !reachable || !authorized {
+        bail!("doctor found a connection or access problem; see checks");
+    }
+    Ok(())
+}
+
+async fn watch_directory(c: &Client, p: &str, dir: &Path) -> Result<()> {
+    let initial = collect(dir, &[], true)?;
+    println!("{}", publish(c, p, initial.clone(), true, false).await?);
+    eprintln!(
+        "watching {}; publishing after changes settle (Ctrl-C to stop)",
+        dir.display()
+    );
+    let mut published = initial.clone();
+    let mut observed = initial;
+    let mut changed = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _=tokio::signal::ctrl_c()=>return Ok(()),
+            _=tokio::time::sleep(std::time::Duration::from_millis(250))=>{}
+        }
+        let next = match collect(dir, &[], true) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("watch: local scan failed; nothing published: {e}");
+                changed = std::time::Instant::now();
+                continue;
+            }
+        };
+        if next != observed {
+            observed = next;
+            changed = std::time::Instant::now();
+            continue;
+        }
+        if observed == published || changed.elapsed() < std::time::Duration::from_millis(750) {
+            continue;
+        }
+        // Stop on server errors or a concurrent revision conflict rather than overwriting it automatically.
+        let result = tokio::select! {
+            _=tokio::signal::ctrl_c()=>return Ok(()),
+            result=publish(c,p,observed.clone(),true,false)=>result?
+        };
+        println!("{result}");
+        published = observed.clone();
+    }
+}
+
+fn text_patch(path: &str, old: &[u8], new: &[u8]) -> Option<String> {
+    if old.len() + new.len() > 1024 * 1024 || old.contains(&0) || new.contains(&0) {
+        return None;
+    }
+    let before = std::str::from_utf8(old).ok()?;
+    let after = std::str::from_utf8(new).ok()?;
+    let a: Vec<_> = before.split_inclusive('\n').collect();
+    let b: Vec<_> = after.split_inclusive('\n').collect();
+    let prefix = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let start = prefix.saturating_sub(3);
+    let ae = (a.len() - suffix + 3).min(a.len());
+    let be = (b.len() - suffix + 3).min(b.len());
+    let mut patch = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{},{} +{},{} @@\n",
+        if ae == start { 0 } else { start + 1 },
+        ae - start,
+        if be == start { 0 } else { start + 1 },
+        be - start
+    );
+    let mut line = |sign: char, value: &str| {
+        patch.push(sign);
+        patch.push_str(value);
+        if !value.ends_with('\n') {
+            patch.push_str("\n\\ No newline at end of file\n");
+        }
+    };
+    for v in &a[start..prefix] {
+        line(' ', v);
+    }
+    for v in &a[prefix..a.len() - suffix] {
+        line('-', v);
+    }
+    for v in &b[prefix..b.len() - suffix] {
+        line('+', v);
+    }
+    for v in &a[a.len() - suffix..ae] {
+        line(' ', v);
+    }
+    Some(patch)
+}
+async fn diff(c: &Client, p: &str, local: BTreeMap<String, Vec<u8>>) -> Result<Value> {
+    let m = c
+        .call(Method::GET, &format!("/api/projects/{p}/manifest"), None)
+        .await?;
+    let remote: BTreeMap<String, String> = serde_json::from_value(m["files"].clone())?;
+    let version = m["version"].as_u64().context("invalid version")?;
+    let names: std::collections::BTreeSet<_> = local.keys().chain(remote.keys()).collect();
+    let mut changes = Vec::new();
+    for name in names {
+        if local
+            .get(name)
+            .is_some_and(|bytes| remote.get(name) == Some(&hash(bytes)))
+        {
+            continue;
+        }
+        let old = if remote.contains_key(name) {
+            let mut url = url::Url::parse(&format!(
+                "{}/api/projects/{p}/versions/{version}/files/",
+                c.upstream
+            ))?;
+            url.path_segments_mut()
+                .unwrap()
+                .pop_if_empty()
+                .extend(name.split('/'));
+            let mut req = c.http.get(url);
+            if let Some(v) = &c.credential {
+                let (u, p) = crate::auth::split(v)?;
+                req = req.basic_auth(u, Some(p));
+            }
+            let bytes = req
+                .send()
+                .await
+                .context("fetching published file")?
+                .error_for_status()?
+                .bytes()
+                .await?
+                .to_vec();
+            if remote.get(name) != Some(&hash(&bytes)) {
+                bail!("published file changed; retry diff");
+            }
+            bytes
+        } else {
+            Vec::new()
+        };
+        let new = local.get(name).map(Vec::as_slice).unwrap_or_default();
+        let kind = if !remote.contains_key(name) {
+            "added"
+        } else if !local.contains_key(name) {
+            "deleted"
+        } else {
+            "modified"
+        };
+        let patch = text_patch(name, &old, new);
+        changes.push(json!({"path":name,"kind":kind,"before_bytes":old.len(),"after_bytes":new.len(),"patch":patch,"content_omitted":patch.is_none()}));
+    }
+    let latest = c
+        .call(Method::GET, &format!("/api/projects/{p}/manifest"), None)
+        .await?;
+    if latest["revision"] != m["revision"] {
+        bail!("revision changed; retry diff");
+    }
+    Ok(json!({"project":p,"version":version,"revision":m["revision"],"changes":changes}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diff_context_and_missing_newline() {
+        let patch = text_patch("index.html", b"keep\nold\ntail\n", b"keep\nnew\ntail\n").unwrap();
+        assert!(patch.contains("@@ -1,3 +1,3 @@\n keep\n-old\n+new\n tail\n"));
+        let patch = text_patch("a", b"old", b"new").unwrap();
+        assert_eq!(patch.matches("No newline at end of file").count(), 2);
+        assert!(text_patch("a", b"\0", b"new").is_none());
+    }
     #[test]
     fn rejects_paths() {
         for p in [
