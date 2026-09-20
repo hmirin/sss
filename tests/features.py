@@ -161,9 +161,12 @@ def exercise_features(binary):
                 assert get(path, admin)[0] == 404, path
             assert doomed not in [v['id'] for v in cli('list')['projects']]
             cli('config', '--project', doomed, '--expires-in', 'none', ok=False)
-            wait_for(lambda: not (data/'projects'/doomed).exists(), seconds=35)
-            with sqlite3.connect(data/'sss.db') as db:
-                assert db.execute('SELECT count(*) FROM projects WHERE id=?', [doomed]).fetchone()[0] == 0
+            def cleanup_complete():
+                if (data/'projects'/doomed).exists():
+                    return False
+                with sqlite3.connect(data/'sss.db') as db:
+                    return db.execute('SELECT count(*) FROM projects WHERE id=?', [doomed]).fetchone()[0] == 0
+            wait_for(cleanup_complete, seconds=35)
             cli('delete', '--project', p)
             cli('delete', '--project', noexpiry)
             restart_expired = cli('new', '--expires-in', '2s')['id']
