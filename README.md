@@ -181,7 +181,7 @@ sss doctor --project a1b2c3
 sss diff ./public --project a1b2c3
 ```
 
-`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
+`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, `expires_in_seconds`, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_in_seconds` is the idle lifetime, or `null` for no expiration. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
 
 `doctor` reports the selected upstream, client/server versions, reachability, and authentication checks as JSON. Without a project it checks shared administration access; with `--project` it checks editing access to that project. It makes no changes and exits nonzero when a check fails.
 
@@ -217,9 +217,9 @@ sss config --project a1b2c3 --name hello --basic_auth_view none --expires-in 7d
 
 Durations are positive whole numbers with `s`, `m`, `h`, `d`, or `w`; `none` disables expiration. JSON configuration accepts `"expires_in": "7d"` or `"expires_in": "none"`; CLI flags override JSON values.
 
-The lifetime starts at creation or when explicitly changed. Uploads, syncs, and rollbacks do not extend it. Omitting the setting on `new` uses the server default (which is `none` unless configured); omitting it on `config` preserves the existing deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
+The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it; `none` removes expiration. Name or authentication changes, reads, and deleting an old version do not renew it. Omitting the setting on `new` uses the server default, which is `none` unless configured. Omitting it on `config` preserves the current lifetime and deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
 
-**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived by extending their deadline. Use `info` or `list` to inspect deadlines before they expire.
+**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived. Use `info` or `list` to inspect deadlines before they expire.
 
 ## Authentication (Optional)
 

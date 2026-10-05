@@ -16,7 +16,7 @@ Optionally add `SSS_BASIC_AUTH=user:password`; restrict the environment file to 
 
 ## Default Project Lifetime
 
-Set `SSS_DEFAULT_EXPIRES_IN=7d` (or `--default-expires-in 7d`) to give new projects a default expiration. The default is `none`. Projects can override it on creation and administrators can change or remove deadlines with `sss config --expires-in`. Existing project deadlines are unaffected by server default changes. Expired projects become inaccessible immediately; all snapshots and metadata are deleted on startup or a 30-second cleanup pass.
+Set `SSS_DEFAULT_EXPIRES_IN=7d` (or `--default-expires-in 7d`) to give new projects a default idle lifetime. The default is `none`. Projects can override it on creation and administrators can change or remove expiration with `sss config --expires-in`. The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it. Name or authentication changes, reads, and deleting an old version do not renew it. Existing projects are unaffected by server default changes. Expired projects become inaccessible immediately and cannot be revived; all snapshots and metadata are deleted on startup or a 30-second cleanup pass.
 
 ## Docker
 
