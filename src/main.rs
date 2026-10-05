@@ -46,7 +46,7 @@ pub enum Command {
         data_dir: Option<PathBuf>,
         #[arg(long, env = "SSS_PUBLIC_URL")]
         public_url: Option<String>,
-        /// Default lifetime for new projects (e.g. 7d, 12h, or none).
+        /// Default idle lifetime for new projects (e.g. 7d, 12h, or none).
         #[arg(long, env = "SSS_DEFAULT_EXPIRES_IN", default_value = "none")]
         default_expires_in: String,
     },
@@ -94,7 +94,7 @@ pub enum Command {
 pub struct ProjectArgs {
     #[arg(long)]
     pub name: Option<String>,
-    /// Lifetime from now (e.g. 7d, 12h, or none to disable expiry).
+    /// Idle lifetime; resets on publish, rollback, or setting it (e.g. 7d, 12h, or none).
     #[arg(long)]
     pub expires_in: Option<String>,
     #[arg(long)]

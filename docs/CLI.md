@@ -22,7 +22,9 @@ sss new --config project.json
 sss new --config -
 ```
 
-`new` returns `id`, `url`, and `expires_at`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omission means `inherit`. These set project policy. `--basic_auth` authenticates the request.
+`new` returns `id`, `url`, `expires_in_seconds`, and `expires_at`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omission means `inherit`. These set project policy. `--basic_auth` authenticates the request.
+
+`list` returns project entries with `id`, `name`, `version`, `expires_in_seconds`, and `expires_at`.
 
 JSON config accepts `name`, `expires_in`, and `auth.view` / `auth.write`. Each auth object has `mode: inherit`, `mode: none`, or `mode: basic` with `username` and `password`. Explicit flags override the corresponding JSON fields.
 
@@ -39,7 +41,7 @@ sss delete old.html --project ID
 
 `upload` adds/replaces relative paths from the working directory; `sync` mirrors a directory including deletions. File deletion publishes a new snapshot. SHA-256 comparison avoids resending unchanged content. A no-op upload/sync returns `unchanged: true` and keeps the current version; an initial empty sync creates version 1.
 
-Dry-run returns `added`, `modified`, and `deleted` paths without creating a version. Publication returns `project`, `version`, `revision`, `url`, and `version_url`.
+Dry-run returns `added`, `modified`, and `deleted` paths without creating a version. Publication returns `project`, `version`, `revision`, `url`, `version_url`, and `expires_at`.
 
 `.sssignore` follows gitignore syntax. Hidden paths, `node_modules`, `target`, `.pem`, and `.key` files are excluded. Symlinks are rejected. The top-level `versions/` path is reserved. Use relative asset URLs.
 
@@ -56,6 +58,8 @@ sss delete --project ID
 
 Versions are increasing integers starting at 1 and are never reused. Rollback changes the current version and concurrency token. The current version cannot be deleted. Whole-project deletion removes all versions and access settings.
 
+Rollback returns project metadata, including `expires_in_seconds` and `expires_at`.
+
 Every snapshot uses current project authentication. Publication is atomic on the server; separate browser requests spanning an update can still observe different versions. Use a fixed version URL when you need a stable snapshot.
 
 ## Change Project Settings
@@ -66,7 +70,7 @@ sss config --project ID --basic_auth_write inherit
 sss config --project ID --config project-auth.json
 ```
 
-The JSON object contains `auth` just as on creation. Only supplied fields change. This command requires shared server credentials when configured; project editing credentials do not authorize it. Use `--name` to rename a project and `--expires-in` to set its lifetime from now or `none` to disable expiration.
+The JSON object contains `auth` just as on creation. Only supplied fields change. This command requires shared server credentials when configured; project editing credentials do not authorize it. Use `--name` to rename a project and `--expires-in` to set its idle lifetime or `none` to disable expiration.
 
 ## Server
 
@@ -108,7 +112,7 @@ sss doctor --project a1b2c3
 sss diff ./public --project a1b2c3
 ```
 
-`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
+`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, `expires_in_seconds`, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_in_seconds` is the idle lifetime, or `null` for no expiration. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
 
 `doctor` reports the selected upstream, client/server versions, reachability, and authentication checks as JSON. Without a project it checks shared administration access; with `--project` it checks editing access to that project. It makes no changes and exits nonzero when a check fails.
 
@@ -144,6 +148,6 @@ sss config --project a1b2c3 --name hello --basic_auth_view none --expires-in 7d
 
 Durations are positive whole numbers with `s`, `m`, `h`, `d`, or `w`; `none` disables expiration. JSON configuration accepts `"expires_in": "7d"` or `"expires_in": "none"`; CLI flags override JSON values.
 
-The lifetime starts at creation or when explicitly changed. Uploads, syncs, and rollbacks do not extend it. Omitting the setting on `new` uses the server default (which is `none` unless configured); omitting it on `config` preserves the existing deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
+The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it; `none` removes expiration. Name or authentication changes, reads, and deleting an old version do not renew it. Omitting the setting on `new` uses the server default, which is `none` unless configured. Omitting it on `config` preserves the current lifetime and deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
 
-**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived by extending their deadline. Use `info` or `list` to inspect deadlines before they expire.
+**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived. Use `info` or `list` to inspect deadlines before they expire.
