@@ -38,10 +38,8 @@ pub fn duration(value: &str) -> Result<Option<i64>> {
     Ok(Some(seconds))
 }
 
-pub fn deadline(seconds: Option<i64>) -> Result<Option<i64>> {
-    seconds
-        .map(|n| now().checked_add(n).context("expiration too large"))
-        .transpose()
+pub fn deadline(seconds: i64) -> Result<i64> {
+    now().checked_add(seconds).context("expiration too large")
 }
 
 #[cfg(test)]

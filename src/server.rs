@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -81,7 +81,7 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS versions(project TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,number INTEGER NOT NULL,PRIMARY KEY(project,number)); PRAGMA user_version=2;")?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS expirations(project TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS expiration_time ON expirations(expires_at);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS expiry(project TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,lifetime INTEGER NOT NULL CHECK(lifetime>0),expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS expiry_time ON expiry(expires_at); DROP TABLE IF EXISTS expirations;")?;
     let admin = credential
         .map(|v| {
             let (u, p) = crate::auth::split(v)?;
@@ -100,24 +100,53 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
         default_lifetime: None,
     })
 }
+#[derive(Clone, Copy)]
+struct Expiry {
+    lifetime: i64,
+    expires_at: i64,
+}
 struct Project {
     name: String,
     revision: String,
     current: u64,
     next: u64,
     access: StoredAccess,
-    expires_at: Option<i64>,
+    expiry: Option<Expiry>,
+}
+fn expiry_for(lifetime: Option<i64>) -> Result<Option<Expiry>> {
+    let Some(lifetime) = lifetime else {
+        return Ok(None);
+    };
+    Ok(Some(Expiry {
+        lifetime,
+        expires_at: crate::expiry::deadline(lifetime)?,
+    }))
+}
+fn expiry_row(r: &Row) -> rusqlite::Result<Expiry> {
+    Ok(Expiry {
+        lifetime: r.get(0)?,
+        expires_at: r.get(1)?,
+    })
+}
+fn renew_expiry(db: &Connection, p: &str) -> Result<Option<Expiry>> {
+    Ok(db
+        .query_row(
+            "UPDATE expiry SET expires_at=?1+lifetime WHERE project=?2 RETURNING lifetime,expires_at",
+            params![crate::expiry::now(), p],
+            expiry_row,
+        )
+        .optional()?)
 }
 fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
-    let expires_at: Option<i64> =
+    let expiry: Option<Expiry> =
         s.db.query_row(
-            "SELECT expires_at FROM expirations WHERE project=?1",
+            "SELECT lifetime,expires_at FROM expiry WHERE project=?1",
             [p],
-            |r| r.get(0),
+            expiry_row,
         )
         .optional()
         .map_err(anyhow::Error::from)?;
-    if expires_at.is_some_and(|t| t <= crate::expiry::now()) {
+    if expiry.is_some_and(|e| e.expires_at <= crate::expiry::now()) {
         return Err(missing());
     }
     let row =
@@ -138,7 +167,7 @@ fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
         .map_err(anyhow::Error::from)?
         .ok_or_else(missing)?;
     Ok(Project {
-        expires_at,
+        expiry,
         name: row.0,
         revision: row.1,
         current: row.2,
@@ -209,7 +238,7 @@ async fn new_project(
         Some(v) => crate::expiry::duration(v).map_err(|_| bad("invalid expires_in"))?,
         None => s.default_lifetime,
     };
-    let expires_at = crate::expiry::deadline(lifetime).map_err(|_| bad("expiration too large"))?;
+    let expiry = expiry_for(lifetime).map_err(|_| bad("expiration too large"))?;
     if body.name.len() > 256 {
         return Err(bad("name too long"));
     }
@@ -230,29 +259,42 @@ async fn new_project(
         ],
     )
     .map_err(anyhow::Error::from)?;
-    if let Some(t) = expires_at {
+    if let Some(expiry) = expiry {
         tx.execute(
-            "INSERT INTO expirations(project,expires_at) VALUES(?1,?2)",
-            params![p, t],
+            "INSERT INTO expiry(project,lifetime,expires_at) VALUES(?1,?2,?3)",
+            params![p, expiry.lifetime, expiry.expires_at],
         )
         .map_err(anyhow::Error::from)?;
     }
     tx.commit().map_err(anyhow::Error::from)?;
     Ok(Json(
-        json!({"id":p,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expires_at}),
+        json!({"id":p,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expiry.map(|e|e.expires_at),"expires_in_seconds":expiry.map(|e|e.lifetime)}),
     ))
 }
 async fn list_projects(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
-    let mut q =
-        s.db.prepare("SELECT id,name,current,(SELECT expires_at FROM expirations WHERE project=id) FROM projects WHERE id NOT IN (SELECT project FROM expirations WHERE expires_at <= unixepoch()) ORDER BY id")
-            .map_err(anyhow::Error::from)?;
-    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"version":r.get::<_,u64>(2)?,"expires_at":r.get::<_,Option<i64>>(3)?}))).map_err(anyhow::Error::from)?.collect::<std::result::Result<Vec<_>,_>>().map_err(anyhow::Error::from)?;
+    let mut q = s
+        .db
+        .prepare("SELECT id,name,current,(SELECT lifetime FROM expiry WHERE project=id),(SELECT expires_at FROM expiry WHERE project=id) FROM projects WHERE id NOT IN (SELECT project FROM expiry WHERE expires_at <= unixepoch()) ORDER BY id")
+        .map_err(anyhow::Error::from)?;
+    let rows = q
+        .query_map([], |r| {
+            Ok(json!({
+                "id":r.get::<_,String>(0)?,
+                "name":r.get::<_,String>(1)?,
+                "version":r.get::<_,u64>(2)?,
+                "expires_in_seconds":r.get::<_,Option<i64>>(3)?,
+                "expires_at":r.get::<_,Option<i64>>(4)?
+            }))
+        })
+        .map_err(anyhow::Error::from)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)?;
     Ok(Json(json!({"projects":rows})))
 }
 fn summary(s: &Store, p: &str, row: &Project) -> Value {
-    json!({"project":p,"expires_at":row.expires_at,"name":row.name,"revision":row.revision,"version":row.current,"url":format!("{}/s/{p}/",s.public_url),"version_url":if row.current==0 {Value::Null}else{json!(format!("{}/s/{p}/versions/{}/",s.public_url,row.current))}})
+    json!({"project":p,"expires_at":row.expiry.map(|e|e.expires_at),"expires_in_seconds":row.expiry.map(|e|e.lifetime),"name":row.name,"revision":row.revision,"version":row.current,"url":format!("{}/s/{p}/",s.public_url),"version_url":if row.current==0 {Value::Null}else{json!(format!("{}/s/{p}/versions/{}/",s.public_url,row.current))}})
 }
 async fn manifest(State(state): State<Shared>, Path(p): Path<String>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
@@ -398,7 +440,7 @@ async fn update(
     let rev = id(12);
     let version = row.next;
     let root = s.root.join("projects").join(&p).join(version.to_string());
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Option<Expiry>> {
         fs::create_dir_all(&root)?;
         for k in desired.keys() {
             let dest = root.join(k);
@@ -418,15 +460,19 @@ async fn update(
             "UPDATE projects SET revision=?1,current=?2,next=?3 WHERE id=?4",
             params![rev, version, version + 1, p],
         )?;
+        let expiry = renew_expiry(&tx, &p)?;
         tx.commit()?;
-        Ok(())
+        Ok(expiry)
     })();
-    if let Err(e) = result {
-        let _ = fs::remove_dir_all(&root);
-        return Err(e.into());
-    }
+    let expiry = match result {
+        Ok(expiry) => expiry,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(e.into());
+        }
+    };
     Ok(Json(
-        json!({"project":p,"revision":rev,"version":version,"version_url":format!("{}/s/{p}/versions/{version}/",s.public_url),"files":desired.len(),"bytes":total,"url":format!("{}/s/{p}/",s.public_url)}),
+        json!({"project":p,"revision":rev,"version":version,"version_url":format!("{}/s/{p}/versions/{version}/",s.public_url),"files":desired.len(),"bytes":total,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expiry.map(|e|e.expires_at)}),
     ))
 }
 
@@ -484,12 +530,11 @@ async fn config(
     if name.len() > 256 {
         return Err(bad("name too long"));
     }
-    let expires_at = match &body.expires_in {
-        None => row.expires_at,
-        Some(v) => crate::expiry::deadline(
-            crate::expiry::duration(v).map_err(|_| bad("invalid expires_in"))?,
-        )
-        .map_err(|_| bad("expiration too large"))?,
+    let update_expiry = body.expires_in.is_some();
+    let expiry = match body.expires_in {
+        None => row.expiry,
+        Some(v) => expiry_for(crate::expiry::duration(&v).map_err(|_| bad("invalid expires_in"))?)
+            .map_err(|_| bad("expiration too large"))?,
     };
     let tx = s.db.transaction().map_err(anyhow::Error::from)?;
     tx.execute(
@@ -501,18 +546,20 @@ async fn config(
         ],
     )
     .map_err(anyhow::Error::from)?;
-    tx.execute("DELETE FROM expirations WHERE project=?1", [&p])
-        .map_err(anyhow::Error::from)?;
-    if let Some(t) = expires_at {
-        tx.execute(
-            "INSERT INTO expirations(project,expires_at) VALUES(?1,?2)",
-            params![p, t],
-        )
-        .map_err(anyhow::Error::from)?;
+    if update_expiry {
+        tx.execute("DELETE FROM expiry WHERE project=?1", [&p])
+            .map_err(anyhow::Error::from)?;
+        if let Some(expiry) = expiry {
+            tx.execute(
+                "INSERT INTO expiry(project,lifetime,expires_at) VALUES(?1,?2,?3)",
+                params![p, expiry.lifetime, expiry.expires_at],
+            )
+            .map_err(anyhow::Error::from)?;
+        }
     }
     tx.commit().map_err(anyhow::Error::from)?;
     Ok(Json(
-        json!({"project":p,"updated":true,"expires_at":expires_at}),
+        json!({"project":p,"updated":true,"expires_at":expiry.map(|e|e.expires_at),"expires_in_seconds":expiry.map(|e|e.lifetime)}),
     ))
 }
 fn access_summary(rule: &StoredRule, admin: bool) -> Value {
@@ -591,7 +638,7 @@ async fn snapshot_file(
 }
 fn purge_expired(s: &Store) -> Result<()> {
     let mut q =
-        s.db.prepare("SELECT project FROM expirations WHERE expires_at <= ?1")?;
+        s.db.prepare("SELECT project FROM expiry WHERE expires_at <= ?1")?;
     let ids = q
         .query_map([crate::expiry::now()], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -652,7 +699,7 @@ async fn rollback(
     h: HeaderMap,
     Json(body): Json<SelectVersion>,
 ) -> ApiResult {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
     auth(&s, &h, Some(&p), "write")?;
     let row = project(&s, &p)?;
     if row.revision != body.base_revision {
@@ -662,11 +709,14 @@ async fn rollback(
         ));
     }
     has_version(&s, &p, body.version)?;
-    s.db.execute(
+    let tx = s.db.transaction().map_err(anyhow::Error::from)?;
+    tx.execute(
         "UPDATE projects SET current=?1,revision=?2 WHERE id=?3",
         params![body.version, id(12), p],
     )
     .map_err(anyhow::Error::from)?;
+    renew_expiry(&tx, &p)?;
+    tx.commit().map_err(anyhow::Error::from)?;
     Ok(Json(summary(&s, &p, &project(&s, &p)?)))
 }
 async fn delete_version(

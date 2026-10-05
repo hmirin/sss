@@ -85,15 +85,22 @@ def exercise_features(binary):
                           '--basic_auth_write', 'writer:write-secret')
             p = created['id']
             assert abs(created['expires_at']-time.time()-604800) < 3
+            assert created['expires_in_seconds'] == 604800
+            listed = next(v for v in cli('list')['projects'] if v['id'] == p)
+            assert listed['expires_in_seconds'] == 604800
+            assert listed['expires_at'] == created['expires_at']
             assert cli('doctor', '--project', p, auth='writer:write-secret')['ok']
             info = cli('info', '--project', p, auth='writer:write-secret')
             assert info['bytes'] == info['storage_bytes'] == info['files'] == 0
+            assert info['expires_in_seconds'] == 604800
             assert info['auth']['view']['mode'] == 'basic'
             assert get(f'/api/projects/{p}', 'reader:view-secret')[0] == 401
             assert 'secret' not in json.dumps(info) and 'hash' not in json.dumps(info)
             cli('config', '--project', p, '--expires-in', 'none', auth='writer:write-secret', ok=False)
-            cli('config', '--project', p, '--expires-in', 'none', '--name', 'renamed')
+            patch = cli('config', '--project', p, '--expires-in', 'none', '--name', 'renamed')
+            assert patch['expires_at'] is None and patch['expires_in_seconds'] is None
             assert cli('info', '--project', p)['expires_at'] is None
+            assert cli('info', '--project', p)['expires_in_seconds'] is None
             assert cli('info', '--project', p)['name'] == 'renamed'
             assert get(f'/api/projects/{p}', admin, {'name': 'must-not-save', 'expires_in': 'bad'}, 'PATCH')[0] == 400
             assert cli('info', '--project', p)['name'] == 'renamed'
@@ -102,15 +109,21 @@ def exercise_features(binary):
             cli('config', '--project', p, '--config', str(settings), '--expires-in', 'none')
             cli('config', '--project', p, '--expires-in', '-2d', ok=False)
             assert cli('info', '--project', p)['expires_at'] is None
-            cli('config', '--project', p, '--expires-in', '1h')
-            expires = cli('info', '--project', p)['expires_at']
+            patch = cli('config', '--project', p, '--expires-in', '1h')
+            assert patch['expires_in_seconds'] == 3600
+            configured = cli('info', '--project', p)
+            expires = configured['expires_at']
+            assert configured['expires_in_seconds'] == 3600
+            cli('config', '--project', p, '--name', 'features-renamed')
+            name_only = cli('info', '--project', p)
+            assert (name_only['expires_at'], name_only['expires_in_seconds']) == (expires, 3600)
             (public/'index.html').write_text('old\n')
             (public/'space #?.txt').write_text('special old\n')
             (public/'remove.txt').write_text('remove\n')
             cli('sync', str(public), '--project', p)
             info = cli('info', '--project', p)
             assert info['files'] == 3 and info['bytes'] == 23
-            assert info['expires_at'] == expires
+            assert info['expires_in_seconds'] == 3600
             (public/'index.html').write_text('new\n')
             (public/'space #?.txt').write_text('special new\n')
             (public/'remove.txt').unlink()
@@ -149,23 +162,52 @@ def exercise_features(binary):
             start('30d')
             inherited = cli('new')['id']
             assert abs(cli('info', '--project', inherited)['expires_at'] - time.time() - 2592000) < 3
+            assert cli('info', '--project', inherited)['expires_in_seconds'] == 2592000
             cli('delete', '--project', inherited)
-            assert cli('info', '--project', p)['expires_at'] == expires
-            noexpiry = cli('new', '--expires-in', 'none')['id']
-            assert cli('info', '--project', noexpiry)['expires_at'] is None
-            doomed = cli('new', '--expires-in', '4s')['id']
-            cli('sync', str(public), '--project', doomed)
-            time.sleep(4.1)
-            for path in [f'/s/{doomed}/', f'/s/{doomed}/versions/1/', f'/api/projects/{doomed}',
-                         f'/api/projects/{doomed}/manifest', f'/api/projects/{doomed}/versions/1/files/index.html']:
+            assert cli('info', '--project', p)['expires_in_seconds'] == 3600
+            noexpiry_created = cli('new', '--expires-in', 'none')
+            noexpiry = noexpiry_created['id']
+            assert noexpiry_created['expires_at'] is None
+            assert noexpiry_created['expires_in_seconds'] is None
+            noexpiry_info = cli('info', '--project', noexpiry)
+            assert noexpiry_info['expires_at'] is None
+            assert noexpiry_info['expires_in_seconds'] is None
+            noexpiry_listed = next(v for v in cli('list')['projects'] if v['id'] == noexpiry)
+            assert noexpiry_listed['expires_at'] is None
+            assert noexpiry_listed['expires_in_seconds'] is None
+            idle_public = root/'idle-public'
+            idle_public.mkdir()
+            (idle_public/'index.html').write_text('idle first version\n')
+            idle = cli('new', '--expires-in', '6s')['id']
+            first_publish = cli('sync', str(idle_public), '--project', idle)
+            first_deadline = first_publish['expires_at']
+            assert cli('info', '--project', idle)['expires_in_seconds'] == 6
+            time.sleep(3.1)
+            (idle_public/'index.html').write_text('idle second version\n')
+            second_publish = cli('sync', str(idle_public), '--project', idle)
+            assert second_publish['expires_at'] > first_deadline
+            second_deadline = second_publish['expires_at']
+            before_name = cli('info', '--project', idle)
+            cli('config', '--project', idle, '--name', 'idle-renamed')
+            after_name = cli('info', '--project', idle)
+            assert (after_name['expires_at'], after_name['expires_in_seconds']) == (
+                before_name['expires_at'], before_name['expires_in_seconds'])
+            wait_for(lambda: int(time.time()) > first_deadline, seconds=8)
+            assert get(f'/s/{idle}/', admin)[0] == 200
+            rolled_back = cli('rollback', '1', '--project', idle)
+            assert rolled_back['expires_in_seconds'] == 6
+            assert rolled_back['expires_at'] > second_deadline
+            wait_for(lambda: int(time.time()) >= rolled_back['expires_at'], seconds=8)
+            for path in [f'/s/{idle}/', f'/s/{idle}/versions/1/', f'/api/projects/{idle}',
+                         f'/api/projects/{idle}/manifest', f'/api/projects/{idle}/versions/1/files/index.html']:
                 assert get(path, admin)[0] == 404, path
-            assert doomed not in [v['id'] for v in cli('list')['projects']]
-            cli('config', '--project', doomed, '--expires-in', 'none', ok=False)
+            assert idle not in [v['id'] for v in cli('list')['projects']]
+            cli('config', '--project', idle, '--expires-in', 'none', ok=False)
             def cleanup_complete():
-                if (data/'projects'/doomed).exists():
+                if (data/'projects'/idle).exists():
                     return False
                 with sqlite3.connect(data/'sss.db') as db:
-                    return db.execute('SELECT count(*) FROM projects WHERE id=?', [doomed]).fetchone()[0] == 0
+                    return db.execute('SELECT count(*) FROM projects WHERE id=?', [idle]).fetchone()[0] == 0
             wait_for(cleanup_complete, seconds=35)
             cli('delete', '--project', p)
             cli('delete', '--project', noexpiry)
