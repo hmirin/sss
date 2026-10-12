@@ -181,7 +181,7 @@ sss doctor --project a1b2c3
 sss diff ./public --project a1b2c3
 ```
 
-`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, `expires_in_seconds`, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_in_seconds` is the idle lifetime, or `null` for no expiration. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
+`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, `expires_in_seconds`, `expires_at`, and `on_expire`. It requires editing access and never returns passwords or hashes. `expires_in_seconds` is the idle lifetime, or `null` for no expiration. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration. `on_expire` is `delete` or `retain`.
 
 `doctor` reports the selected upstream, client/server versions, reachability, and authentication checks as JSON. Without a project it checks shared administration access; with `--project` it checks editing access to that project. It makes no changes and exits nonzero when a check fails.
 
@@ -219,7 +219,21 @@ Durations are positive whole numbers with `s`, `m`, `h`, `d`, or `w`; `none` dis
 
 The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it; `none` removes expiration. Name or authentication changes, reads, and deleting an old version do not renew it. Omitting the setting on `new` uses the server default, which is `none` unless configured. Omitting it on `config` preserves the current lifetime and deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
 
-**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived. Use `info` or `list` to inspect deadlines before they expire.
+Choose what cleanup does with expired content:
+
+```sh
+sss new --name preview --expires-in 1d --on-expire delete
+sss new --name archive --expires-in 1d --on-expire retain
+sss config --project a1b2c3 --on-expire retain
+sss serve --default-on-expire retain
+# Or set SSS_DEFAULT_ON_EXPIRE=retain in the server environment.
+```
+
+`delete` removes the entire expired project and all its versions. `retain` keeps its files, versions, metadata, and exact deadline in server storage. Both policies make all project APIs and static URLs unavailable at the deadline, including images and fixed versions. Expired projects disappear from `list`, and shared administrator credentials cannot access them. There is no API to browse or revive expired retained projects.
+
+JSON configuration accepts `"on_expire": "delete"` or `"on_expire": "retain"`. CLI flags override JSON values. New projects inherit the server default when the field is omitted or `null`. The product default is `delete`. Config omission or `null` preserves the project's policy. Changing only `on_expire` does not renew the deadline. The policy persists when expiration is disabled and applies if a lifetime is set again. Setting the server default changes only future projects and does not introduce a lifetime.
+
+Cleanup runs on startup and every 30 seconds and removes only expired projects with `on_expire=delete`; failed filesystem cleanup is retried. Retained expired projects continue to consume disk. Use `info` or `list` to inspect `on_expire` and deadlines before they expire. `doctor` without a project reports `default_on_expire` and `default_expires_in_seconds` in its server administration check.
 
 ## Authentication (Optional)
 
@@ -232,7 +246,7 @@ export SSS_BASIC_AUTH='user:example-password'
 sss serve
 ```
 
-This shared credential protects project creation, global listing, project settings changes, and, by default, all project viewing and editing. It can administer every project. If `SSS_BASIC_AUTH` is unset, server-wide operations require no authentication and projects inherit that default.
+This shared credential protects project creation, global listing, project settings changes, and, by default, all project viewing and editing. It can administer every active project. If `SSS_BASIC_AUTH` is unset, server-wide operations require no authentication and projects inherit that default.
 
 Projects inherit this authentication by default. You can override viewing and editing access for individual projects.
 
@@ -302,7 +316,7 @@ Explicit `--basic_auth_view` and `--basic_auth_write` options override the corre
 | `none` | Explicitly disable authentication for this project operation, even if a server default is set. |
 | `basic` | Use the project's specified username and password. |
 
-Both viewing and editing support all three modes. Project-specific credentials authorize only the configured operation on that project; they do not grant server-wide administration. The server's shared credential retains access to every project, including projects with overrides.
+Both viewing and editing support all three modes. Project-specific credentials authorize only the configured operation on that project; they do not grant server-wide administration. The server's shared credential retains access to every active project, including projects with overrides.
 
 Creating projects, listing all projects, and changing project settings use the server's shared authentication. If it is unset, those operations remain unauthenticated even when a project has its own password. Set `SSS_BASIC_AUTH` on the server if you need to protect those operations.
 
@@ -380,6 +394,8 @@ Give the output to your agent, or save it as `SKILL.md` in your agent's skill di
 ### Storage
 
 By default, `sss serve` creates `~/.sss` and stores its configuration, project metadata, and version files there. Use `--data-dir` or `SSS_DATA_DIR` to choose another location. Back up the entire data directory to preserve projects and their versions.
+
+SQLite stores use format 3. On first startup, this build atomically upgrades a format 2 store and assigns `delete` to every existing project. It preserves project settings, versions, deadlines, and file contents. Other older formats are rejected. Binaries without format 3 support refuse the upgraded store before cleanup. Keep a stopped-server backup if you need to return to an older binary.
 
 ## Build and Check
 
