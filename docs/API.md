@@ -7,12 +7,12 @@ Shared server credentials authorize all operations. Without shared credentials, 
 | Method | Path | Body / result | Authentication |
 |---|---|---|---|
 | GET | `/health` | `status`, `version` | None |
-| POST | `/api/projects` | Optional `name`, `auth`, `expires_in`; returns `id`, `url`, `expires_in_seconds`, `expires_at` | Shared |
+| POST | `/api/projects` | Optional `name`, `auth`, `expires_in`, `max_storage`; returns `id`, `url`, `expires_in_seconds`, `expires_at`, `max_storage_bytes` | Shared |
 | GET | `/api/projects` | `projects` array with `id`, `name`, `version`, `expires_in_seconds`, `expires_at` | Shared |
-| GET | `/api/projects/{id}` | Metadata, current file count/bytes, total storage_bytes, auth modes, `expires_in_seconds`, `expires_at` | Edit |
+| GET | `/api/projects/{id}` | Metadata, current file count/bytes, total storage_bytes, quota_used_bytes, max_storage_bytes, auth modes, `expires_in_seconds`, `expires_at` | Edit |
 | GET | `/api/projects/{id}/manifest` | Current metadata and file hashes | Edit |
-| PATCH | `/api/projects/{id}` | Optional `name`, `auth.view`, `auth.write`, `expires_in`; returns `expires_in_seconds`, `expires_at` | Shared |
-| GET | `/api/status` | Server version, authentication_required, default_expires_in_seconds | Shared |
+| PATCH | `/api/projects/{id}` | Optional `name`, `auth.view`, `auth.write`, `expires_in`, `max_storage`; returns `expires_in_seconds`, `expires_at`, `max_storage_bytes` | Shared |
+| GET | `/api/status` | Server version, authentication_required, default_expires_in_seconds, quota_used_bytes, max_total_storage_bytes | Shared |
 | GET | `/api/projects/{id}/versions/{n}/files/{path}` | Raw snapshot file bytes for diff | Edit |
 | POST | `/api/projects/{id}/versions` | Publish a snapshot; returns `expires_at`; see below | Edit |
 | GET | `/api/projects/{id}/versions` | `project`, `current`, `versions` (integers) | Edit |
@@ -38,6 +38,8 @@ File values are base64-encoded bytes. `upload` preserves existing files. `sync` 
 
 A stale revision returns 409. Rollback also changes this token. Validate the whole update before publishing; rejected uploads never alter the active snapshot. The CLI skips no-op uploads; a direct successful publication request creates a version.
 
+Quota defaults are 500 MiB per project and 10 GiB across the server. The server checks both limits before creating each new snapshot, including direct API requests that copy unchanged files. Exceeding a limit returns 507 without changing the project. Delete old versions to free space; snapshots are never deleted automatically to admit a publish. Quota usage reserves 4 KiB per project for metadata, 64 KiB per version, 4 KiB per directory, and 4 KiB per file plus its content rounded up to 4 KiB. `storage_bytes` reports file payload separately. Other files in the data directory are not charged.
+
 ## Static Content
 
 `/s/{id}/` serves the current snapshot; `/s/{id}/versions/{n}/` serves a retained snapshot. Trailing-slash paths resolve to `index.html`. Version numbers are canonical integers without leading zeros. The top-level `versions/` namespace cannot be uploaded.
@@ -48,6 +50,6 @@ All snapshots use current project viewing authentication, including missing asse
 
 `expires_in` is a positive integer followed by `s`, `m`, `h`, `d`, or `w`, or the string `none`. Omission on POST inherits the configured server default; omission on PATCH preserves the current lifetime and deadline. The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it; `none` removes expiration. Name or authentication changes, reads, and deleting an old version do not renew it. Responses expose `expires_in_seconds` as an integer or null and `expires_at` as Unix seconds or null. Server defaults apply only on creation. Existing projects without a deadline remain unlimited.
 
-PATCH validates and applies name, authentication and expiration together. For example: `{"auth":{"view":{"mode":"none"}},"expires_in":"7d"}`. Config changes require shared administration access, not project editing credentials. Authentication summaries expose configured modes, effective authentication_required, and a custom username only; never passwords or hashes.
+PATCH validates and applies name, authentication, expiration, and `max_storage` together. For example: `{"auth":{"view":{"mode":"none"}},"expires_in":"7d","max_storage":"500MiB"}`. `max_storage` accepts a positive whole number followed by `B`, `KiB`, `MiB`, or `GiB`; omission preserves the current limit. A lower limit can be set below existing usage without deleting data, but further publication then fails until usage falls. Server operators set the global limit with `--max-total-storage` or `SSS_MAX_TOTAL_STORAGE` and restart the server. Config changes require shared administration access, not project editing credentials. Authentication summaries expose configured modes, effective authentication_required, and a custom username only; never passwords or hashes.
 
 Expired projects return 404 from all project/file endpoints, including fixed version URLs, and are excluded from listing. Files and metadata are removed on startup or the next 30-second cleanup pass; failed deletions are retried. Expired projects cannot be revived.
