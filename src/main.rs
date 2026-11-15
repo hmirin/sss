@@ -49,6 +49,9 @@ pub enum Command {
         /// Default idle lifetime for new projects (e.g. 7d, 12h, or none).
         #[arg(long, env = "SSS_DEFAULT_EXPIRES_IN", default_value = "none")]
         default_expires_in: String,
+        /// Maximum time to process one request, including receiving its body.
+        #[arg(long, env = "SSS_REQUEST_TIMEOUT_SECONDS", default_value_t = 180)]
+        request_timeout_seconds: u64,
     },
     /// Create a project. Does not change the working directory or save credentials.
     New(ProjectArgs),
@@ -118,6 +121,7 @@ async fn main() {
             data_dir,
             public_url,
             default_expires_in,
+            request_timeout_seconds,
         }) => match data_dir.clone().map(Ok).unwrap_or_else(default_data_dir) {
             Ok(root) => {
                 let url = public_url
@@ -129,6 +133,7 @@ async fn main() {
                     &url,
                     cli.basic_auth.as_deref(),
                     default_expires_in,
+                    std::time::Duration::from_secs(*request_timeout_seconds),
                 )
                 .await
             }

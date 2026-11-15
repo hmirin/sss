@@ -197,9 +197,82 @@ def exercise(shared):
             log.close()
 
 
+def exercise_request_timeout():
+    with tempfile.TemporaryDirectory(prefix='sss-timeout-') as tmp:
+        root = Path(tmp)
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        upstream = f'http://127.0.0.1:{port}'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('SSS_')}
+        env.update(SSS_LISTEN='127.0.0.1', SSS_PORT=str(port),
+                   SSS_DATA_DIR=str(root / 'data'), SSS_PUBLIC_URL=upstream,
+                   SSS_REQUEST_TIMEOUT_SECONDS='2')
+        with open(root / 'server.log', 'w+') as log:
+            server = subprocess.Popen([BINARY, 'serve'], env=env, stdout=log, stderr=log)
+            sockets = []
+            try:
+                for _ in range(150):
+                    try:
+                        if urlopen(upstream + '/health', timeout=1).status == 200:
+                            break
+                    except OSError:
+                        pass
+                    if server.poll() is not None:
+                        log.seek(0)
+                        raise AssertionError(log.read())
+                    time.sleep(.05)
+                else:
+                    raise AssertionError('server readiness timed out')
+
+                for _ in range(2):
+                    sock = socket.create_connection(('127.0.0.1', port), timeout=2)
+                    sockets.append(sock)
+                    sock.sendall(b'POST /api/projects HTTP/1.1\r\nHost: localhost\r\n'
+                                 b'Content-Type: application/json\r\nContent-Length: 100\r\n'
+                                 b'Connection: keep-alive\r\n\r\n{"name":"unfinished"')
+                busy = False
+                busy_deadline = time.monotonic() + 1.5
+                while time.monotonic() < busy_deadline:
+                    try:
+                        urlopen(upstream + '/health', timeout=1)
+                    except HTTPError as err:
+                        if err.code == 503:
+                            busy = True
+                            break
+                        raise
+                    time.sleep(.02)
+                assert busy, 'stalled bodies should consume both permits initially'
+
+                recovered = False
+                recovery_deadline = time.monotonic() + 4
+                while time.monotonic() < recovery_deadline:
+                    try:
+                        recovered = urlopen(upstream + '/health', timeout=1).status == 200
+                    except HTTPError as err:
+                        assert err.code == 503, err.code
+                    if recovered:
+                        break
+                    time.sleep(.02)
+                assert recovered, 'permits did not recover while stalled sockets remained open'
+                sockets[0].settimeout(2)
+                assert b' 408 ' in sockets[0].recv(4096).split(b'\r\n', 1)[0]
+                body = json.dumps({'name': 'control'}).encode()
+                response = urlopen(Request(upstream + '/api/projects', method='POST',
+                                           headers={'Content-Type': 'application/json'},
+                                           data=body), timeout=2)
+                assert response.status == 200
+            finally:
+                for sock in sockets:
+                    sock.close()
+                server.terminate()
+                server.wait(timeout=10)
+
+
 if __name__ == '__main__':
     exercise(None)
     exercise('admin:shared-password')
+    exercise_request_timeout()
     from features import exercise_features
     exercise_features(BINARY)
     skill = subprocess.check_output([BINARY, '--skill'], text=True)

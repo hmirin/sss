@@ -83,9 +83,12 @@ sss serve --listen 127.0.0.1 --port 8080 --data-dir /var/lib/sss --public-url ht
 |---|---|---|
 | `--listen` | `SSS_LISTEN` | `127.0.0.1` |
 | `--default-expires-in` | `SSS_DEFAULT_EXPIRES_IN` | `none` |
+| `--request-timeout-seconds` | `SSS_REQUEST_TIMEOUT_SECONDS` | `180` |
 | `--port` | `SSS_PORT` | `8080` |
 | `--data-dir` | `SSS_DATA_DIR` | `~/.sss` |
 | `--public-url` | `SSS_PUBLIC_URL` | `http://localhost:<port>` |
+
+The request timeout includes receiving the body. When it expires, the server returns HTTP 408 and releases the request's concurrency slot. Set a higher value if legitimate uploads need more than three minutes.
 
 `SSS_BASIC_AUTH` configures shared server authentication. It covers administration and inherited project access. Explicit project `none` and `basic` override inheritance. Shared credentials retain access to all projects. Only hashes of project passwords are stored; server environment credentials are hashed in memory.
 

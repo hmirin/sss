@@ -819,7 +819,11 @@ pub async fn serve(
     url: &str,
     credential: Option<&str>,
     default_expires_in: &str,
+    request_timeout: std::time::Duration,
 ) -> Result<()> {
+    if request_timeout.is_zero() {
+        bail!("request timeout must be positive")
+    }
     let parsed = url::Url::parse(url)?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -918,7 +922,12 @@ pub async fn serve(
                         return (StatusCode::SERVICE_UNAVAILABLE, "server busy; retry")
                             .into_response();
                     };
-                    next.run(request).await
+                    match tokio::time::timeout(request_timeout, next.run(request)).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            (StatusCode::REQUEST_TIMEOUT, "request timed out").into_response()
+                        }
+                    }
                 }
             },
         ))
