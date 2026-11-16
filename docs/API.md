@@ -12,7 +12,7 @@ Shared server credentials authorize administration and access to active projects
 | GET | `/api/projects/{id}` | Metadata, current file count/bytes, total storage_bytes, quota_used_bytes, max_storage_bytes, auth modes, `expires_in_seconds`, `expires_at`, `on_expire` | Edit |
 | GET | `/api/projects/{id}/manifest` | Current metadata and file hashes | Edit |
 | PATCH | `/api/projects/{id}` | Optional `name`, `auth.view`, `auth.write`, `expires_in`, `max_storage`, `on_expire`; returns `expires_in_seconds`, `expires_at`, `max_storage_bytes`, `on_expire` | Shared |
-| GET | `/api/status` | Server version, authentication_required, default_expires_in_seconds, quota_used_bytes, max_total_storage_bytes, default_on_expire | Shared |
+| GET | `/api/status` | Server version, authentication_required, default_expires_in_seconds, default_view_auth, quota_used_bytes, max_total_storage_bytes, default_on_expire | Shared |
 | GET | `/api/projects/{id}/versions/{n}/files/{path}` | Raw snapshot file bytes for diff | Edit |
 | POST | `/api/projects/{id}/versions` | Publish a snapshot; returns `expires_at`; see below | Edit |
 | GET | `/api/projects/{id}/versions` | `project`, `current`, `versions` (integers) | Edit |
@@ -45,6 +45,8 @@ Quota defaults are 500 MiB per project and 10 GiB across the server. The server 
 `/s/{id}/` serves the current snapshot; `/s/{id}/versions/{n}/` serves a retained snapshot. Trailing-slash paths resolve to `index.html`. Version numbers are canonical integers without leading zeros. The top-level `versions/` namespace cannot be uploaded.
 
 All snapshots use current project viewing authentication, including missing asset requests. Responses include guessed MIME types, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, a no-referrer policy, and a CSP disabling workers and cross-origin framing. Projects share an origin.
+
+On project creation, an omitted `auth.view` uses the server's `default_view_auth` setting (`inherit` unless configured as `none`). This also applies when `auth` contains only `write`. An explicit viewing rule always wins, including `inherit`. An omitted `auth.write` remains `inherit`. The resolved rules are stored with the project; server default changes never reinterpret existing rules. PATCH continues to preserve omitted rules.
 
 ## Expiration and Settings
 

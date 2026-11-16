@@ -1,5 +1,5 @@
 use crate::{
-    auth::{Access, Rule, StoredAccess, StoredRule},
+    auth::{Access, DefaultViewAuth, Rule, StoredAccess, StoredRule},
     expiry::ExpiryAction,
     hash, id, valid_path,
 };
@@ -33,6 +33,7 @@ struct Store {
     public_url: String,
     admin: Option<StoredRule>,
     default_lifetime: Option<i64>,
+    default_view_auth: DefaultViewAuth,
     default_on_expire: ExpiryAction,
     max_total_storage: u64,
     quota_used: u64,
@@ -144,6 +145,7 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
         public_url: url.trim_end_matches('/').into(),
         admin,
         default_lifetime: None,
+        default_view_auth: DefaultViewAuth::default(),
         default_on_expire: ExpiryAction::default(),
         max_total_storage: 0,
         quota_used: 0,
@@ -281,7 +283,7 @@ struct NewProject {
     #[serde(default)]
     name: String,
     #[serde(default)]
-    auth: Access,
+    auth: PatchAccess,
     expires_in: Option<String>,
     max_storage: Option<String>,
     on_expire: Option<ExpiryAction>,
@@ -325,10 +327,12 @@ async fn new_project(
     if body.name.len() > 256 {
         return Err(bad("name too long"));
     }
-    let access = body
-        .auth
-        .store()
-        .map_err(|_| bad("invalid authentication settings"))?;
+    let access = Access {
+        view: body.auth.view.unwrap_or_else(|| s.default_view_auth.into()),
+        write: body.auth.write.unwrap_or_default(),
+    }
+    .store()
+    .map_err(|_| bad("invalid authentication settings"))?;
     let p = id(6);
     let rev = id(12);
     let tx = s.db.transaction().map_err(anyhow::Error::from)?;
@@ -705,7 +709,7 @@ async fn delete_project(
     }
     Ok(Json(json!({"deleted":p})))
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchAccess {
     view: Option<Rule>,
@@ -840,7 +844,7 @@ async fn status(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
     Ok(Json(
-        json!({"version":env!("CARGO_PKG_VERSION"),"authentication_required":s.admin.is_some(),"default_expires_in_seconds":s.default_lifetime,"max_total_storage_bytes":s.max_total_storage,"quota_used_bytes":s.quota_used,"default_on_expire":s.default_on_expire}),
+        json!({"version":env!("CARGO_PKG_VERSION"),"authentication_required":s.admin.is_some(),"default_expires_in_seconds":s.default_lifetime,"default_view_auth":s.default_view_auth,"max_total_storage_bytes":s.max_total_storage,"quota_used_bytes":s.quota_used,"default_on_expire":s.default_on_expire}),
     ))
 }
 async fn snapshot_file(
@@ -1064,6 +1068,7 @@ fn static_file(state: Shared, p: String, path: String, h: HeaderMap) -> Response
 pub struct ServeOptions<'a> {
     pub default_expires_in: &'a str,
     pub default_on_expire: ExpiryAction,
+    pub default_view_auth: DefaultViewAuth,
     pub request_timeout: std::time::Duration,
     pub max_total_storage: &'a str,
 }
@@ -1078,6 +1083,7 @@ pub async fn serve(
     let ServeOptions {
         default_expires_in,
         default_on_expire,
+        default_view_auth,
         request_timeout,
         max_total_storage,
     } = options;
@@ -1107,6 +1113,7 @@ pub async fn serve(
     let mut store = open(root, url, credential)?;
     store.default_lifetime = crate::expiry::duration(default_expires_in)?;
     store.default_on_expire = default_on_expire;
+    store.default_view_auth = default_view_auth;
     store.max_total_storage = storage_size(max_total_storage)?;
     purge_expired(&mut store)?;
     // Only remove uncommitted or deleted versions; retained snapshots survive restarts.

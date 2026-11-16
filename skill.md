@@ -57,11 +57,11 @@ Both options accept:
 
 | Value | Access rule |
 |---|---|
-| `inherit` | Use the server's `SSS_BASIC_AUTH`; this is the default. |
+| `inherit` | Use the server's `SSS_BASIC_AUTH`. |
 | `none` | No authentication for this operation. |
 | `username:password` | Project-specific Basic authentication. |
 
-Leave these options omitted unless the requested access rules call for an override. Project settings can also be supplied with `sss new --config project.json` or `--config -` for JSON on stdin. Explicit access flags override the corresponding JSON fields.
+Leave these options omitted unless the requested access rules call for an override. On creation, an omitted viewing rule uses the server's `--default-view-auth` / `SSS_DEFAULT_VIEW_AUTH` setting (`inherit` by default, or `none`). An omitted editing rule remains `inherit`. Explicit `inherit` overrides a server viewing default of `none`. Existing project access is unchanged when server defaults change. Use separate credentials for viewing and administration. Project settings can also be supplied with `sss new --config project.json` or `--config -` for JSON on stdin. Explicit access flags override the corresponding JSON fields.
 
 ```json
 {

@@ -23,7 +23,7 @@ sss new --config project.json
 sss new --config -
 ```
 
-`new` returns `id`, `url`, `expires_in_seconds`, `expires_at`, and `on_expire`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omission means `inherit`. These set project policy. `--basic_auth` authenticates the request.
+`new` returns `id`, `url`, `expires_in_seconds`, `expires_at`, and `on_expire`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omitting the viewing rule uses the server's `--default-view-auth` setting, and omitting the editing rule uses `inherit`. These set project policy. `--basic_auth` authenticates the request.
 
 `list` returns project entries with `id`, `name`, `version`, `expires_in_seconds`, `expires_at`, and `on_expire`.
 
@@ -86,11 +86,14 @@ sss serve --max-total-storage 10GiB
 |---|---|---|
 | `--listen` | `SSS_LISTEN` | `127.0.0.1` |
 | `--default-expires-in` | `SSS_DEFAULT_EXPIRES_IN` | `none` |
+| `--default-view-auth` | `SSS_DEFAULT_VIEW_AUTH` | `inherit` |
 | `--request-timeout-seconds` | `SSS_REQUEST_TIMEOUT_SECONDS` | `180` |
 | `--max-total-storage` | `SSS_MAX_TOTAL_STORAGE` | `10GiB` |
 | `--port` | `SSS_PORT` | `8080` |
 | `--data-dir` | `SSS_DATA_DIR` | `~/.sss` |
 | `--public-url` | `SSS_PUBLIC_URL` | `http://localhost:<port>` |
+
+`--default-view-auth` accepts `inherit` or `none`. It supplies the viewing rule when `new` omits `auth.view`, including when `auth` contains only `write`. Explicit `inherit`, `none`, and project-specific Basic credentials override this default. The rule is saved at creation; changing the server default does not change existing projects. Editing still defaults to `inherit`. Use `none` to allow credential-free viewing within the server's network boundary while requiring shared credentials for administration and inherited editing.
 
 The request timeout includes receiving the body. When it expires, the server returns HTTP 408 and releases the request's concurrency slot. Set a higher value if legitimate uploads need more than three minutes.
 
