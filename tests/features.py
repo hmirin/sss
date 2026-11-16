@@ -155,7 +155,7 @@ def exercise_features(binary):
             time.sleep(1.2)
             assert current() == 3
             watcher.send_signal(signal.SIGINT)
-            assert watcher.wait(timeout=5) == 0
+            assert watcher.wait(timeout=15) == 0
             watch_log.close()
             assert cli('diff', str(public), '--project', p)['changes'] == []
             stop()

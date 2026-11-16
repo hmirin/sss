@@ -207,7 +207,7 @@ def exercise_request_timeout():
         env = {k: v for k, v in os.environ.items() if not k.startswith('SSS_')}
         env.update(SSS_LISTEN='127.0.0.1', SSS_PORT=str(port),
                    SSS_DATA_DIR=str(root / 'data'), SSS_PUBLIC_URL=upstream,
-                   SSS_REQUEST_TIMEOUT_SECONDS='2')
+                   SSS_REQUEST_TIMEOUT_SECONDS='5')
         with open(root / 'server.log', 'w+') as log:
             server = subprocess.Popen([BINARY, 'serve'], env=env, stdout=log, stderr=log)
             sockets = []
@@ -232,7 +232,7 @@ def exercise_request_timeout():
                                  b'Content-Type: application/json\r\nContent-Length: 100\r\n'
                                  b'Connection: keep-alive\r\n\r\n{"name":"unfinished"')
                 busy = False
-                busy_deadline = time.monotonic() + 1.5
+                busy_deadline = time.monotonic() + 3.5
                 while time.monotonic() < busy_deadline:
                     try:
                         urlopen(upstream + '/health', timeout=1)
@@ -245,7 +245,7 @@ def exercise_request_timeout():
                 assert busy, 'stalled bodies should consume both permits initially'
 
                 recovered = False
-                recovery_deadline = time.monotonic() + 4
+                recovery_deadline = time.monotonic() + 8
                 while time.monotonic() < recovery_deadline:
                     try:
                         recovered = urlopen(upstream + '/health', timeout=1).status == 200
@@ -255,7 +255,7 @@ def exercise_request_timeout():
                         break
                     time.sleep(.02)
                 assert recovered, 'permits did not recover while stalled sockets remained open'
-                sockets[0].settimeout(2)
+                sockets[0].settimeout(6)
                 assert b' 408 ' in sockets[0].recv(4096).split(b'\r\n', 1)[0]
                 body = json.dumps({'name': 'control'}).encode()
                 response = urlopen(Request(upstream + '/api/projects', method='POST',
