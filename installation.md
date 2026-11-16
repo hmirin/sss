@@ -26,6 +26,14 @@ Follow these steps on each machine that needs sss.
 2. Detect the operating system and CPU architecture. Download the matching archive from the [GitHub releases](https://github.com/hmirin/sss/releases), using the latest stable release unless a version was requested. Inspect the release assets rather than constructing an asset filename. Extract the archive to obtain `sss`.
 3. Install `sss` into an existing user-writable directory on `PATH`, or use `~/.local/bin`. If necessary, add that directory to the user's shell configuration without duplicating an existing entry.
 
+If Rust and Cargo are available, the crates.io package is another way to install the same `sss` command:
+
+```sh
+cargo install simple-static-server --locked
+```
+
+Cargo builds the binary from published source. The GitHub release attestation instructions below apply to downloaded release archives.
+
 If a matching binary is unavailable, build from source with Rust and Cargo:
 
 ```sh
