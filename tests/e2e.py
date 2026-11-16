@@ -197,9 +197,197 @@ def exercise(shared):
             log.close()
 
 
+def exercise_request_timeout():
+    with tempfile.TemporaryDirectory(prefix='sss-timeout-') as tmp:
+        root = Path(tmp)
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        upstream = f'http://127.0.0.1:{port}'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('SSS_')}
+        env.update(SSS_LISTEN='127.0.0.1', SSS_PORT=str(port),
+                   SSS_DATA_DIR=str(root / 'data'), SSS_PUBLIC_URL=upstream,
+                   SSS_REQUEST_TIMEOUT_SECONDS='10')
+        with open(root / 'server.log', 'w+') as log:
+            server = subprocess.Popen([BINARY, 'serve'], env=env, stdout=log, stderr=log)
+            sockets = []
+            try:
+                for _ in range(150):
+                    try:
+                        if urlopen(upstream + '/health', timeout=1).status == 200:
+                            break
+                    except OSError:
+                        pass
+                    if server.poll() is not None:
+                        log.seek(0)
+                        raise AssertionError(log.read())
+                    time.sleep(.05)
+                else:
+                    raise AssertionError('server readiness timed out')
+
+                for _ in range(2):
+                    sock = socket.create_connection(('127.0.0.1', port), timeout=2)
+                    sockets.append(sock)
+                    sock.sendall(b'POST /api/projects HTTP/1.1\r\nHost: localhost\r\n'
+                                 b'Expect: 100-continue\r\n'
+                                 b'Content-Type: application/json\r\nContent-Length: 100\r\n'
+                                 b'Connection: keep-alive\r\n\r\n')
+                    sock.settimeout(3)
+                    assert sock.recv(4096).split(b'\r\n', 1)[0] == b'HTTP/1.1 100 Continue'
+                try:
+                    urlopen(upstream + '/health', timeout=2)
+                except HTTPError as err:
+                    assert err.code == 503, err.code
+                else:
+                    raise AssertionError('stalled bodies should consume both permits initially')
+
+                recovered = False
+                recovery_deadline = time.monotonic() + 15
+                while time.monotonic() < recovery_deadline:
+                    try:
+                        recovered = urlopen(upstream + '/health', timeout=1).status == 200
+                    except HTTPError as err:
+                        assert err.code == 503, err.code
+                    if recovered:
+                        break
+                    time.sleep(.02)
+                assert recovered, 'permits did not recover while stalled sockets remained open'
+                sockets[0].settimeout(12)
+                assert b' 408 ' in sockets[0].recv(4096).split(b'\r\n', 1)[0]
+                body = json.dumps({'name': 'control'}).encode()
+                response = urlopen(Request(upstream + '/api/projects', method='POST',
+                                           headers={'Content-Type': 'application/json'},
+                                           data=body), timeout=2)
+                assert response.status == 200
+            finally:
+                for sock in sockets:
+                    sock.close()
+                server.terminate()
+                server.wait(timeout=10)
+
+
+def exercise_storage_quota():
+    with tempfile.TemporaryDirectory(prefix='sss-quota-') as tmp:
+        root = Path(tmp)
+        work = root / 'work'
+        work.mkdir()
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        upstream = f'http://127.0.0.1:{port}'
+        env = {k: v for k, v in os.environ.items() if not k.startswith('SSS_')}
+        env.update(SSS_LISTEN='127.0.0.1', SSS_PORT=str(port),
+                   SSS_DATA_DIR=str(root / 'data'), SSS_PUBLIC_URL=upstream,
+                   SSS_UPSTREAM=upstream, SSS_MAX_TOTAL_STORAGE='256KiB')
+        server = None
+
+        def start():
+            nonlocal server
+            server = subprocess.Popen([BINARY, 'serve'], env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            for _ in range(150):
+                try:
+                    if urlopen(upstream + '/health', timeout=1).status == 200:
+                        return
+                except OSError:
+                    pass
+                if server.poll() is not None:
+                    raise AssertionError(server.stderr.read().decode())
+                time.sleep(.05)
+            raise AssertionError('quota server readiness timed out')
+
+        def cli(*args, ok=True):
+            result = subprocess.run([BINARY, *args], cwd=work, env=env,
+                                    text=True, capture_output=True, timeout=30)
+            assert (result.returncode == 0) == ok, (args, result.stderr)
+            return json.loads(result.stdout) if ok else result.stderr
+
+        def request(path, body):
+            try:
+                response = urlopen(Request(upstream + path, method='POST',
+                                           headers={'Content-Type': 'application/json'},
+                                           data=json.dumps(body).encode()), timeout=5)
+            except HTTPError as err:
+                response = err
+            return response.status, json.loads(response.read())
+
+        try:
+            start()
+            a = cli('new', '--max-storage', '200KiB')['id']
+            b = cli('new', '--max-storage', '1MiB')['id']
+            assert cli('info', '--project', a)['max_storage_bytes'] == 200 * 1024
+            (work / 'index.html').write_bytes(b'ab')
+            cli('upload', 'index.html', '--project', a)
+            (work / 'index.html').write_bytes(b'cd')
+            cli('upload', 'index.html', '--project', a)
+            before = cli('info', '--project', a)
+            assert before['storage_bytes'] == 4 and before['version'] == 2
+            assert before['quota_used_bytes'] > before['storage_bytes']
+            status, _ = request(f'/api/projects/{a}/versions',
+                                {'mode': 'upload', 'files': {}, 'base_revision': before['revision']})
+            assert status == 507
+            assert cli('info', '--project', a) == before
+            assert cli('versions', '--project', a)['versions'] == [1, 2]
+            cli('delete-version', '1', '--project', a)
+            status, published = request(f'/api/projects/{a}/versions',
+                                        {'mode': 'upload', 'files': {}, 'base_revision': before['revision']})
+            assert status == 200 and published['version'] == 3
+            assert cli('config', '--project', a, '--max-storage', '100KiB')['max_storage_bytes'] == 100 * 1024
+            assert cli('info', '--project', a)['storage_bytes'] == 4
+            status, _ = request(f'/api/projects/{a}/versions',
+                                {'mode': 'upload', 'files': {}, 'base_revision': published['revision']})
+            assert status == 507
+            cli('delete-version', '2', '--project', a)
+            assert cli('info', '--project', a)['storage_bytes'] == 2
+
+            (work / 'index.html').write_bytes(b'wxyz')
+            cli('upload', 'index.html', '--project', b)
+            (work / 'index.html').write_bytes(b'pq')
+            cli('upload', 'index.html', '--project', b)
+            before = cli('info', '--project', b)
+            assert before['storage_bytes'] == 6
+            assert json.loads(urlopen(upstream + '/api/status').read())['max_total_storage_bytes'] == 256 * 1024
+            status, _ = request(f'/api/projects/{b}/versions',
+                                {'mode': 'upload', 'files': {}, 'base_revision': before['revision']})
+            assert status == 507
+            empty = cli('new')['id']
+            empty_revision = cli('info', '--project', empty)['revision']
+            status, _ = request(f'/api/projects/{empty}/versions',
+                                {'mode': 'sync', 'files': {}, 'keep': [], 'base_revision': empty_revision})
+            assert status == 507
+            for _ in range(7):
+                cli('new')
+            assert '507' in cli('new', ok=False)
+            (work / 'index.html').write_bytes(b'r')
+            assert '507' in cli('upload', 'index.html', '--project', b, ok=False)
+            assert cli('info', '--project', b) == before
+            cli('delete-version', '1', '--project', b)
+            cli('upload', 'index.html', '--project', b)
+            assert cli('info', '--project', b)['storage_bytes'] == 3
+            quota_before_restart = json.loads(urlopen(upstream + '/api/status').read())['quota_used_bytes']
+
+            server.terminate()
+            server.wait(timeout=10)
+            server.stderr.close()
+            start()
+            assert cli('info', '--project', a)['max_storage_bytes'] == 100 * 1024
+            assert cli('info', '--project', b)['storage_bytes'] == 3
+            assert json.loads(urlopen(upstream + '/api/status').read())['quota_used_bytes'] == quota_before_restart
+            assert cli('new', '--max-storage', '0B', ok=False)
+        finally:
+            if server and server.poll() is None:
+                server.terminate()
+                server.wait(timeout=10)
+            if server and server.stderr:
+                server.stderr.close()
+
+
 if __name__ == '__main__':
+    assert subprocess.check_output([BINARY, '--version'], text=True).startswith('sss ')
     exercise(None)
     exercise('admin:shared-password')
+    exercise_request_timeout()
+    exercise_storage_quota()
     from features import exercise_features
     exercise_features(BINARY)
     skill = subprocess.check_output([BINARY, '--skill'], text=True)

@@ -11,6 +11,12 @@ View artifacts created by Codex, Claude, or other agents from any computer or mo
 
 ## Quick Start
 
+Install the `sss` command with Cargo:
+
+```sh
+cargo install simple-static-server --locked
+```
+
 > [!TIP]
 > TL;DR: Just ask your agent to:
 > ```text
@@ -395,7 +401,9 @@ Give the output to your agent, or save it as `SKILL.md` in your agent's skill di
 
 By default, `sss serve` creates `~/.sss` and stores its configuration, project metadata, and version files there. Use `--data-dir` or `SSS_DATA_DIR` to choose another location. Back up the entire data directory to preserve projects and their versions.
 
-SQLite stores use format 3. On first startup, this build atomically upgrades a format 2 store and assigns `delete` to every existing project. It preserves project settings, versions, deadlines, and file contents. Other older formats are rejected. Binaries without format 3 support refuse the upgraded store before cleanup. Keep a stopped-server backup if you need to return to an older binary.
+SQLite stores use format 4. First startup atomically upgrades format 2 or 3, preserves existing settings, versions, deadlines, files, and storage limits, and assigns the historical `delete` policy to existing projects. Format 2 stores also gain the storage-limit field. Older binaries refuse format 4 before cleanup. Keep a stopped-server backup if a downgrade may be needed.
+
+Retained storage quotas default to 10 GiB across the server and 500 MiB per project. Use `sss serve --max-total-storage 10GiB` for the server limit and `sss config --project ID --max-storage 500MiB` for a project's limit. When a publish would exceed either limit, it is rejected without deleting old versions. Quota accounting includes reserves for versions, directories, and files so empty snapshots consume quota. See [CLI storage limits](docs/CLI.md#publish) for details.
 
 ## Build and Check
 

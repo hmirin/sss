@@ -110,7 +110,7 @@ Use the deployment's external URL as `--public-url`. Preserve the data directory
 
 ## Inspect, Compare, and Diagnose
 
-- `sss info --project ID`: URLs, version, current file count/bytes, total storage_bytes, authentication modes, expires_in_seconds (integer or null), expires_at (Unix seconds or null), and on_expire (delete or retain). Requires editing access; no passwords or hashes are returned.
+- `sss info --project ID`: URLs, version, current file count/bytes, total payload storage_bytes, charged quota_used_bytes, max_storage_bytes, authentication modes, expires_in_seconds (integer or null), expires_at (Unix seconds or null), and on_expire (delete or retain). Requires editing access; no passwords or hashes are returned.
 - `sss doctor [--project ID]`: read-only JSON connectivity/version/authentication checks. Without a project, checks shared admin access; with a project, checks edit access. A failed check exits nonzero.
 - `sss diff ./public --project ID`: read-only JSON changes with unified text patches. Binary, non-UTF-8, and file pairs over 1 MiB omit content and report sizes. Requires editing access. Retry if the server revision changed.
 - `sss sync ./public --project ID --watch`: initial sync then poll every 250 ms and publish after 750 ms of quiet. Prints JSON lines per publication. Ctrl-C stops it. Cannot combine with --dry-run. Local scan errors pause publication; server errors and revision conflicts stop the watcher. Local content is authoritative for each new batch, so coordinate simultaneous editors.
@@ -123,6 +123,7 @@ sss new --name preview --expires-in 1d
 sss config --project ID --expires-in 30d
 sss config --project ID --expires-in none
 sss config --project ID --name renamed --basic_auth_view none --expires-in 7d
+sss config --project ID --max-storage 500MiB
 sss new --name retained --expires-in 1d --on-expire retain
 sss config --project ID --on-expire delete
 sss serve --default-on-expire retain
@@ -134,6 +135,8 @@ The server also reads `SSS_DEFAULT_EXPIRES_IN`; the default is `none`. Accept po
 
 The server reads `SSS_DEFAULT_ON_EXPIRE`; the product default is `delete`. `--default-on-expire` overrides it for future projects only and does not set a lifetime. JSON settings accept `on_expire`; explicit CLI flags override JSON. Omission or null on creation inherits the server default; omission or null on config preserves the project's policy. Changing only the policy preserves the exact deadline. Disabling and re-enabling expiration preserves the policy. New/config/info/list expose on_expire, and doctor without a project reports default_on_expire in its server administration check.
 
-Cleanup runs on startup and every 30 seconds and deletes only due projects with on_expire=delete. Retained expired content continues to consume disk. Reuse the user's agreed retention policy; do not invent a finite lifetime for permanent artifacts. Check expires_at and on_expire with info/list before expiration. Changes to authentication, name, expiration, and cleanup policy use shared administration authentication.
+Cleanup runs on startup and every 30 seconds and deletes only due projects with on_expire=delete. Retained expired content and all quota reserves remain charged after restart. Reuse the user's agreed retention policy; do not invent a finite lifetime for permanent artifacts. Check expires_at and on_expire with info/list before expiration. Changes to authentication, name, expiration, and cleanup policy use shared administration authentication.
 
-Stores use SQLite format 3. First startup atomically upgrades format 2, preserves existing content and settings, and gives existing projects the historical delete policy. Other older formats are rejected. Older binaries without format 3 support refuse an upgraded store before cleanup. Preserve a stopped-server backup before upgrading when a downgrade may be needed.
+Stores use SQLite format 4. First startup atomically upgrades format 2 or 3, preserves existing content and settings, and gives existing projects the historical delete policy. Other older formats are rejected. Older binaries without format 4 support refuse an upgraded store before cleanup. Preserve a stopped-server backup before upgrading when a downgrade may be needed.
+
+Retained storage quotas default to 500 MiB per project and 10 GiB for the server. Operators can change the global limit with `sss serve --max-total-storage SIZE` or `SSS_MAX_TOTAL_STORAGE`, and project administrators can set `sss new --max-storage SIZE` or `sss config --project ID --max-storage SIZE`. Sizes use B, KiB, MiB, or GiB. Quota usage includes reserves for versions, directories, and files, so even empty versions consume quota. A publish that exceeds either limit fails without deleting old versions; use `sss delete-version` or ask the administrator to adjust the limit. Project limit changes require shared administration authentication.

@@ -42,11 +42,11 @@ The image binds to `0.0.0.0:8080` inside the container. Set `SSS_PUBLIC_URL` to 
 
 SQLite records project policy, current version, the next version number, and retained snapshots. Version files live below `projects/<id>/<number>/`. A data-directory lock prevents two servers from sharing a store. Startup removes uncommitted snapshot directories while keeping all retained versions.
 
-Back up the entire data directory while the service is stopped. Restore it with its original permissions. Delete obsolete versions to reclaim disk, or configure expiration with `on_expire=delete`. Current versions cannot be deleted. Expiration with `retain` does not reclaim storage.
+Back up the entire data directory while the service is stopped. Restore it with its original permissions. Delete obsolete versions to reclaim disk, or configure expiration with `on_expire=delete`. Current versions cannot be deleted. Expiration with `retain` does not reclaim storage. Retained expired content and its project, version, directory, and file reserves continue to count against the server quota after restart. Expiration with `delete` releases those charges only after successful cleanup.
 
-New stores use SQLite `user_version=3`. This build atomically upgrades a format 2 store on first startup by adding the required `projects.on_expire` column. Every existing project gets the historical `delete` policy, independently of the configured server default. The conversion preserves all existing project fields, versions, lifetimes, exact deadlines, and files. It runs once. Other unsupported formats, including the API-key prototype, are rejected without migration.
+New stores use SQLite `user_version=4`. This build atomically upgrades a format 2 or 3 store on first startup by adding the required `projects.on_expire` column. Format 2 stores also gain the required `max_storage` field; format 3 project limits are preserved. Every existing project gets the historical `delete` policy, independently of the configured server default. The conversion preserves all existing project fields, versions, lifetimes, exact deadlines, and files. It runs once. Other unsupported formats, including the API-key prototype, are rejected without migration.
 
-Binaries without format 3 support refuse the upgraded store before cleanup. Keep a stopped-server backup of the complete format 2 store if you may need to return to an older binary. A binary downgrade alone cannot open format 3.
+Binaries without format 4 support refuse the upgraded store before cleanup. Keep a stopped-server backup of the complete pre-upgrade store if you may need to return to an older binary. A binary downgrade alone cannot open format 4.
 
 ## Updating
 

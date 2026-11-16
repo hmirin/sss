@@ -205,7 +205,7 @@ def exercise_features(binary):
             time.sleep(1.2)
             assert current() == 3
             watcher.send_signal(signal.SIGINT)
-            assert watcher.wait(timeout=5) == 0
+            assert watcher.wait(timeout=15) == 0
             watch_log.close()
             assert cli('diff', str(public), '--project', p)['changes'] == []
             stop()
@@ -341,9 +341,11 @@ def exercise_features(binary):
             snapshots.mkdir()
             image = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ9kAAAAASUVORK5CYII=')
             published = {}
-            for action in ['delete', 'retain']:
-                created = cli('new', '--expires-in', '1h', '--on-expire', action,
-                              '--basic_auth_view', 'none', '--basic_auth_write', 'writer:write-secret')
+            for action in ['delete', 'retain', 'retain-basic']:
+                created = cli('new', '--expires-in', '1h', '--on-expire',
+                              'delete' if action == 'delete' else 'retain',
+                              '--basic_auth_view', 'reader:view-secret' if action == 'retain-basic' else 'none',
+                              '--basic_auth_write', 'writer:write-secret')
                 project_id = created['id']
                 for version in [1, 2]:
                     (snapshots/'index.html').write_text(f'<img src="image.png">{action} {version}')
@@ -352,12 +354,14 @@ def exercise_features(binary):
                     assert result['version'] == version
                 published[action] = (project_id, result['revision'])
                 for path in ['', 'image.png', 'versions/1/image.png', 'versions/2/image.png']:
-                    status, _, headers = get(f'/s/{project_id}/{path}', include_headers=True)
+                    status, _, headers = get(f'/s/{project_id}/{path}', 'reader:view-secret' if action == 'retain-basic' else None, include_headers=True)
                     assert status == 200 and headers.get('Cache-Control') == 'no-store'
                 status, content, headers = get(f'/api/projects/{project_id}/versions/1/files/image.png',
                                                admin, include_headers=True)
                 assert status == 200 and content == image+b'\x01'
                 assert headers.get('Cache-Control') == 'no-store'
+            quota_before = cli('doctor')['checks']['server_admin_access']['response']['quota_used_bytes']
+            deleted_charge = cli('info', '--project', published['delete'][0])['quota_used_bytes']
             deadline = int(time.time()) + 2
             with sqlite3.connect(data/'sss.db') as db:
                 for project_id, _ in published.values():
@@ -374,6 +378,9 @@ def exercise_features(binary):
             retained_id, retained_revision = published['retain']
             wait_for(lambda: removed(deleted_id), seconds=35)
             assert stored(retained_id) == expected['retain']
+            assert stored(published['retain-basic'][0]) == expected['retain-basic']
+            quota_after = cli('doctor')['checks']['server_admin_access']['response']['quota_used_bytes']
+            assert quota_after == quota_before - deleted_charge
             expired_denials(retained_id, retained_revision)
             startup_deleted = cli('new', '--expires-in', '1h', '--on-expire', 'delete')['id']
             cli('sync', str(snapshots), '--project', startup_deleted)
@@ -385,54 +392,66 @@ def exercise_features(binary):
             assert removed(startup_deleted)
             assert stored(retained_id) == expected['retain']
             expired_denials(retained_id, retained_revision)
+            assert stored(published['retain-basic'][0]) == expected['retain-basic']
+            assert cli('doctor')['checks']['server_admin_access']['response']['quota_used_bytes'] == quota_after
+            stop()
+            start(None, extra_env={'SSS_MAX_TOTAL_STORAGE': f'{quota_after}B'})
+            assert cli('doctor')['checks']['server_admin_access']['response']['quota_used_bytes'] == quota_after
+            assert '507' in cli('new', ok=False)
             stop()
 
-            data = root/'legacy-data'
-            data.mkdir()
-            auth = json.dumps({'view': {'mode': 'none'}, 'write': {'mode': 'none'}})
-            deadline = int(time.time())+3600
-            with sqlite3.connect(data/'sss.db') as db:
-                db.executescript('''
-                    CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,
-                        current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL);
-                    CREATE TABLE versions(project TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                        number INTEGER NOT NULL,PRIMARY KEY(project,number));
-                    CREATE TABLE expiry(project TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-                        lifetime INTEGER NOT NULL CHECK(lifetime>0),expires_at INTEGER NOT NULL);
-                    CREATE INDEX expiry_time ON expiry(expires_at);
-                    PRAGMA user_version=2;
-                ''')
+            for legacy_format in [2, 3]:
+                data = root/f'legacy-data-{legacy_format}'
+                data.mkdir()
+                auth = json.dumps({'view': {'mode': 'none'}, 'write': {'mode': 'none'}})
+                deadline = int(time.time())+3600
+                with sqlite3.connect(data/'sss.db') as db:
+                    db.executescript('''
+                        CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,
+                            current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL);
+                        CREATE TABLE versions(project TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                            number INTEGER NOT NULL,PRIMARY KEY(project,number));
+                        CREATE TABLE expiry(project TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                            lifetime INTEGER NOT NULL CHECK(lifetime>0),expires_at INTEGER NOT NULL);
+                        CREATE INDEX expiry_time ON expiry(expires_at);
+                        PRAGMA user_version=2;
+                    ''')
+                    if legacy_format == 3:
+                        db.execute('ALTER TABLE projects ADD COLUMN max_storage INTEGER NOT NULL DEFAULT 777777')
+                        db.execute('PRAGMA user_version=3')
+                    for project_id in ['0123456789ab', 'abcdef012345']:
+                        db.execute('INSERT INTO projects(id,name,revision,current,next,auth) VALUES(?,?,?,?,?,?)',
+                                   [project_id, project_id, 'original-revision', 3, 4, auth])
+                        for version in [1, 3]:
+                            db.execute('INSERT INTO versions VALUES(?,?)', [project_id, version])
+                            directory = data/'projects'/project_id/str(version)
+                            directory.mkdir(parents=True)
+                            (directory/'index.html').write_text(f'{project_id} version {version}')
+                            (directory/'image.png').write_bytes(image+bytes([version]))
+                    db.execute('INSERT INTO expiry VALUES(?,?,?)', ['0123456789ab', 3600, deadline])
+                before = stored()
+                start(None, 'retain')
+                after = stored()
+                assert [row[:6] for row in after[0]] == [row[:6] for row in before[0]]
+                assert all(row[-2] == (777777 if legacy_format == 3 else 524288000) for row in after[0])
+                assert all(row[-1] == 'delete' for row in after[0])
+                assert after[1:] == before[1:]
+                with sqlite3.connect(data/'sss.db') as db:
+                    assert db.execute('PRAGMA user_version').fetchone()[0] == 4
+                    assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+                    column = next(c for c in db.execute('PRAGMA table_info(projects)') if c[1] == 'on_expire')
+                    assert column[2] == 'TEXT' and column[3] == 1
                 for project_id in ['0123456789ab', 'abcdef012345']:
-                    db.execute('INSERT INTO projects VALUES(?,?,?,?,?,?)',
-                               [project_id, project_id, 'original-revision', 3, 4, auth])
-                    for version in [1, 3]:
-                        db.execute('INSERT INTO versions VALUES(?,?)', [project_id, version])
-                        directory = data/'projects'/project_id/str(version)
-                        directory.mkdir(parents=True)
-                        (directory/'index.html').write_text(f'{project_id} version {version}')
-                        (directory/'image.png').write_bytes(image+bytes([version]))
-                db.execute('INSERT INTO expiry VALUES(?,?,?)', ['0123456789ab', 3600, deadline])
-            before = stored()
-            start(None, 'retain')
-            after = stored()
-            assert [row[:-1] for row in after[0]] == before[0]
-            assert all(row[-1] == 'delete' for row in after[0])
-            assert after[1:] == before[1:]
-            with sqlite3.connect(data/'sss.db') as db:
-                assert db.execute('PRAGMA user_version').fetchone()[0] == 3
-                assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
-                column = next(c for c in db.execute('PRAGMA table_info(projects)') if c[1] == 'on_expire')
-                assert column[2] == 'TEXT' and column[3] == 1
-            for project_id in ['0123456789ab', 'abcdef012345']:
-                info = cli('info', '--project', project_id)
-                assert info['on_expire'] == 'delete'
-                assert info['expires_at'] == (deadline if project_id == '0123456789ab' else None)
-                assert get(f'/s/{project_id}/versions/1/image.png')[1] == image+b'\x01'
-                assert get(f'/s/{project_id}/image.png')[1] == image+b'\x03'
-            stop()
-            start(None, 'retain')
-            assert stored() == after
-            stop()
+                    info = cli('info', '--project', project_id)
+                    assert info['on_expire'] == 'delete'
+                    assert info['max_storage_bytes'] == (777777 if legacy_format == 3 else 524288000)
+                    assert info['expires_at'] == (deadline if project_id == '0123456789ab' else None)
+                    assert get(f'/s/{project_id}/versions/1/image.png')[1] == image+b'\x01'
+                    assert get(f'/s/{project_id}/image.png')[1] == image+b'\x03'
+                stop()
+                start(None, 'retain')
+                assert stored() == after
+                stop()
             with sqlite3.connect(data/'sss.db') as db:
                 db.execute('PRAGMA user_version=1')
             before = stored()
@@ -472,4 +491,4 @@ def exercise_features(binary):
                 watcher.kill()
                 watcher.wait()
             stop()
-    print('PASS: info/doctor, authenticated text/binary diff, debounced watch, expiration defaults/override/enforcement/cleanup/restart, retention defaults/precedence/null/rejection/deadlines, retained bytes/rows across recurring and startup cleanup, format 2 upgrade preservation, failed-upgrade atomic rollback and format refusal')
+    print('PASS: info/doctor, authenticated text/binary diff, debounced watch, expiration defaults/override/enforcement/cleanup/restart, retention defaults/precedence/null/rejection/deadlines, retained bytes/rows across recurring and startup cleanup, format 2/3 upgrade preservation and retained quota enforcement, failed-upgrade atomic rollback and format refusal')

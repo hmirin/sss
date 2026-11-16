@@ -16,13 +16,17 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
 };
 const MAX_BYTES: usize = 50 * 1024 * 1024;
 const MAX_FILES: usize = 5000;
+const DEFAULT_PROJECT_MAX_STORAGE: i64 = 500 * 1024 * 1024;
+const VERSION_CHARGE: u64 = 64 * 1024;
+const ENTRY_CHARGE: u64 = 4 * 1024;
+const PROJECT_CHARGE: u64 = ENTRY_CHARGE;
 struct Store {
     db: Connection,
     root: PathBuf,
@@ -30,8 +34,13 @@ struct Store {
     admin: Option<StoredRule>,
     default_lifetime: Option<i64>,
     default_on_expire: ExpiryAction,
+    max_total_storage: u64,
+    quota_used: u64,
+    project_quota_used: BTreeMap<String, u64>,
+    quota_poisoned: bool,
 }
 type Shared = Arc<Mutex<Store>>;
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -63,6 +72,28 @@ fn bad(s: &str) -> ApiError {
 fn missing() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found".into())
 }
+fn storage_size(value: &str) -> Result<u64> {
+    let (number, multiplier) = [
+        ("GiB", 1024u64.pow(3)),
+        ("MiB", 1024u64.pow(2)),
+        ("KiB", 1024),
+        ("B", 1),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| value.strip_suffix(suffix).map(|n| (n, multiplier)))
+    .context("storage size must end in B, KiB, MiB, or GiB")?;
+    if number.is_empty() || !number.bytes().all(|c| c.is_ascii_digit()) {
+        bail!("storage size must be a positive whole number")
+    }
+    let bytes = number
+        .parse::<u64>()?
+        .checked_mul(multiplier)
+        .context("storage size is too large")?;
+    if bytes == 0 || bytes > i64::MAX as u64 {
+        bail!("storage size must be between 1 and i64::MAX bytes")
+    }
+    Ok(bytes)
+}
 fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
     fs::create_dir_all(root.join("projects"))?;
     #[cfg(unix)]
@@ -77,19 +108,25 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
         [],
         |r| r.get(0),
     )?;
-    if (exists && !matches!(version, 2 | 3)) || (!exists && version != 0) {
-        bail!("unsupported data format; expected format 2 or 3 (existing data was not migrated)")
+    if (exists && !matches!(version, 2..=4)) || (!exists && version != 0) {
+        bail!(
+            "unsupported data format; expected format 2, 3, or 4 (existing data was not migrated)"
+        )
     }
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     let tx = db.transaction()?;
-    if version == 2 {
+    if exists && version == 2 {
+        tx.execute_batch("ALTER TABLE projects ADD COLUMN max_storage INTEGER NOT NULL DEFAULT 524288000 CHECK(max_storage>0);")?;
+    }
+    if exists && version < 4 {
         tx.execute_batch("ALTER TABLE projects ADD COLUMN on_expire TEXT NOT NULL DEFAULT 'delete' CHECK(on_expire IN ('delete','retain'));")?;
     }
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL,on_expire TEXT NOT NULL DEFAULT 'delete' CHECK(on_expire IN ('delete','retain')));
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL,max_storage INTEGER NOT NULL DEFAULT 524288000 CHECK(max_storage>0),on_expire TEXT NOT NULL DEFAULT 'delete' CHECK(on_expire IN ('delete','retain')));
         CREATE TABLE IF NOT EXISTS versions(project TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,number INTEGER NOT NULL,PRIMARY KEY(project,number));
         CREATE TABLE IF NOT EXISTS expiry(project TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,lifetime INTEGER NOT NULL CHECK(lifetime>0),expires_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS expiry_time ON expiry(expires_at);
-        PRAGMA user_version=3;")?;
+        DROP TABLE IF EXISTS expirations;
+        PRAGMA user_version=4;")?;
     tx.commit()?;
     let admin = credential
         .map(|v| {
@@ -108,6 +145,10 @@ fn open(root: &FsPath, url: &str, credential: Option<&str>) -> Result<Store> {
         admin,
         default_lifetime: None,
         default_on_expire: ExpiryAction::default(),
+        max_total_storage: 0,
+        quota_used: 0,
+        project_quota_used: BTreeMap::new(),
+        quota_poisoned: false,
     })
 }
 #[derive(Clone, Copy)]
@@ -122,6 +163,7 @@ struct Project {
     next: u64,
     access: StoredAccess,
     expiry: Option<Expiry>,
+    max_storage: u64,
     on_expire: ExpiryAction,
 }
 fn expiry_for(lifetime: Option<i64>) -> Result<Option<Expiry>> {
@@ -162,7 +204,7 @@ fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
     }
     let row =
         s.db.query_row(
-            "SELECT name,revision,current,next,auth,on_expire FROM projects WHERE id=?1",
+            "SELECT name,revision,current,next,auth,max_storage,on_expire FROM projects WHERE id=?1",
             [p],
             |r| {
                 Ok((
@@ -171,7 +213,8 @@ fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
                     r.get::<_, u64>(2)?,
                     r.get::<_, u64>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, ExpiryAction>(5)?,
+                    r.get::<_, u64>(5)?,
+                    r.get::<_, ExpiryAction>(6)?,
                 ))
             },
         )
@@ -185,7 +228,8 @@ fn project(s: &Store, p: &str) -> std::result::Result<Project, ApiError> {
         current: row.2,
         next: row.3,
         access: serde_json::from_str(&row.4).map_err(anyhow::Error::from)?,
-        on_expire: row.5,
+        max_storage: row.5,
+        on_expire: row.6,
     })
 }
 fn auth(
@@ -239,6 +283,7 @@ struct NewProject {
     #[serde(default)]
     auth: Access,
     expires_in: Option<String>,
+    max_storage: Option<String>,
     on_expire: Option<ExpiryAction>,
 }
 async fn new_project(
@@ -248,12 +293,35 @@ async fn new_project(
 ) -> ApiResult {
     let mut s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
+    if s.quota_poisoned {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage quota needs recovery; restart server".into(),
+        ));
+    }
+    let next_total = s
+        .quota_used
+        .checked_add(PROJECT_CHARGE)
+        .ok_or_else(|| bad("server storage quota exceeded"))?;
+    if next_total > s.max_total_storage {
+        return Err(ApiError(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "server storage quota exceeded".into(),
+        ));
+    }
     let lifetime = match &body.expires_in {
         Some(v) => crate::expiry::duration(v).map_err(|_| bad("invalid expires_in"))?,
         None => s.default_lifetime,
     };
     let expiry = expiry_for(lifetime).map_err(|_| bad("expiration too large"))?;
     let on_expire = body.on_expire.unwrap_or(s.default_on_expire);
+    let max_storage = body
+        .max_storage
+        .as_deref()
+        .map(storage_size)
+        .transpose()
+        .map_err(|_| bad("invalid max_storage"))?
+        .unwrap_or(DEFAULT_PROJECT_MAX_STORAGE as u64);
     if body.name.len() > 256 {
         return Err(bad("name too long"));
     }
@@ -265,13 +333,14 @@ async fn new_project(
     let rev = id(12);
     let tx = s.db.transaction().map_err(anyhow::Error::from)?;
     tx.execute(
-        "INSERT INTO projects(id,name,revision,auth,on_expire) VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO projects(id,name,revision,auth,max_storage,on_expire) VALUES(?1,?2,?3,?4,?5,?6)",
         params![
             p,
             body.name,
             rev,
             serde_json::to_string(&access).map_err(anyhow::Error::from)?,
-            on_expire
+            max_storage,
+            on_expire,
         ],
     )
     .map_err(anyhow::Error::from)?;
@@ -283,8 +352,10 @@ async fn new_project(
         .map_err(anyhow::Error::from)?;
     }
     tx.commit().map_err(anyhow::Error::from)?;
+    s.quota_used = next_total;
+    s.project_quota_used.insert(p.clone(), PROJECT_CHARGE);
     Ok(Json(
-        json!({"id":p,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expiry.map(|e|e.expires_at),"expires_in_seconds":expiry.map(|e|e.lifetime),"on_expire":on_expire}),
+        json!({"id":p,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expiry.map(|e|e.expires_at),"expires_in_seconds":expiry.map(|e|e.lifetime),"max_storage_bytes":max_storage,"on_expire":on_expire}),
     ))
 }
 async fn list_projects(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
@@ -311,7 +382,7 @@ async fn list_projects(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
     Ok(Json(json!({"projects":rows})))
 }
 fn summary(s: &Store, p: &str, row: &Project) -> Value {
-    json!({"project":p,"expires_at":row.expiry.map(|e|e.expires_at),"expires_in_seconds":row.expiry.map(|e|e.lifetime),"on_expire":row.on_expire,"name":row.name,"revision":row.revision,"version":row.current,"url":format!("{}/s/{p}/",s.public_url),"version_url":if row.current==0 {Value::Null}else{json!(format!("{}/s/{p}/versions/{}/",s.public_url,row.current))}})
+    json!({"project":p,"expires_at":row.expiry.map(|e|e.expires_at),"expires_in_seconds":row.expiry.map(|e|e.lifetime),"max_storage_bytes":row.max_storage,"on_expire":row.on_expire,"name":row.name,"revision":row.revision,"version":row.current,"url":format!("{}/s/{p}/",s.public_url),"version_url":if row.current==0 {Value::Null}else{json!(format!("{}/s/{p}/versions/{}/",s.public_url,row.current))}})
 }
 async fn manifest(State(state): State<Shared>, Path(p): Path<String>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
@@ -349,6 +420,87 @@ fn files(root: &FsPath) -> Result<BTreeMap<String, String>> {
     }
     Ok(result)
 }
+fn charged_file_size(size: u64) -> Result<u64> {
+    let blocks = size
+        .checked_add(ENTRY_CHARGE - 1)
+        .context("stored size overflow")?
+        / ENTRY_CHARGE;
+    blocks
+        .checked_mul(ENTRY_CHARGE)
+        .context("stored size overflow")?
+        .checked_add(ENTRY_CHARGE)
+        .context("stored size overflow")
+}
+fn quota_used(root: &FsPath, version_depth: usize) -> Result<u64> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!("symlink in storage")
+        }
+        let charge = if entry.depth() == 0 {
+            0
+        } else if entry.file_type().is_dir() && entry.depth() == version_depth {
+            VERSION_CHARGE
+        } else if entry.file_type().is_dir() {
+            ENTRY_CHARGE
+        } else if entry.file_type().is_file() {
+            charged_file_size(entry.metadata()?.len())?
+        } else {
+            bail!("unexpected entry in storage")
+        };
+        total = total.checked_add(charge).context("stored size overflow")?;
+    }
+    Ok(total)
+}
+fn rebuild_quota(s: &mut Store) -> Result<()> {
+    let mut query = s.db.prepare("SELECT id FROM projects")?;
+    let ids = query
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut projects = BTreeMap::new();
+    let mut total = 0u64;
+    for id in ids {
+        let used = PROJECT_CHARGE
+            .checked_add(quota_used(&s.root.join("projects").join(&id), 1)?)
+            .context("project quota overflow")?;
+        total = total.checked_add(used).context("server quota overflow")?;
+        projects.insert(id, used);
+    }
+    s.project_quota_used = projects;
+    s.quota_used = total;
+    s.quota_poisoned = false;
+    Ok(())
+}
+fn snapshot_charge(
+    old_root: &FsPath,
+    desired: &BTreeMap<String, String>,
+    decoded: &BTreeMap<String, Vec<u8>>,
+) -> Result<u64> {
+    let mut total = VERSION_CHARGE;
+    let mut directories = BTreeSet::new();
+    for path in desired.keys() {
+        let size = match decoded.get(path) {
+            Some(bytes) => bytes.len() as u64,
+            None => fs::metadata(old_root.join(path))?.len(),
+        };
+        total = total
+            .checked_add(charged_file_size(size)?)
+            .context("snapshot charge overflow")?;
+        let mut parent = FsPath::new(path).parent();
+        while let Some(dir) = parent.filter(|dir| !dir.as_os_str().is_empty()) {
+            directories.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+    total = total
+        .checked_add(directories.len() as u64 * ENTRY_CHARGE)
+        .context("snapshot charge overflow")?;
+    Ok(total)
+}
 #[derive(Deserialize)]
 struct Update {
     mode: String,
@@ -369,6 +521,12 @@ async fn update(
     }
     let mut s = state.lock().unwrap();
     auth(&s, &h, Some(&p), &body.mode)?;
+    if s.quota_poisoned {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage quota needs recovery; restart server".into(),
+        ));
+    }
     let row = project(&s, &p)?;
     let old = row.revision.clone();
     if body.base_revision.as_deref() != Some(&old) {
@@ -447,12 +605,43 @@ async fn update(
         return Err(bad("too many files"));
     }
     for k in desired.keys().filter(|k| !decoded.contains_key(*k)) {
-        total += fs::metadata(old_root.join(k))
-            .map_err(anyhow::Error::from)?
-            .len() as usize;
+        total = total
+            .checked_add(
+                usize::try_from(
+                    fs::metadata(old_root.join(k))
+                        .map_err(anyhow::Error::from)?
+                        .len(),
+                )
+                .map_err(anyhow::Error::from)?,
+            )
+            .ok_or_else(|| bad("project quota exceeded"))?;
     }
     if total > MAX_BYTES {
         return Err(bad("project quota exceeded"));
+    }
+    let charge = snapshot_charge(&old_root, &desired, &decoded)?;
+    let next_project_bytes = s
+        .project_quota_used
+        .get(&p)
+        .copied()
+        .context("missing project quota state")?
+        .checked_add(charge)
+        .ok_or_else(|| bad("project storage quota exceeded"))?;
+    let next_all_bytes = s
+        .quota_used
+        .checked_add(charge)
+        .ok_or_else(|| bad("server storage quota exceeded"))?;
+    if next_project_bytes > row.max_storage {
+        return Err(ApiError(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "project storage quota exceeded; delete an old version or raise max_storage".into(),
+        ));
+    }
+    if next_all_bytes > s.max_total_storage {
+        return Err(ApiError(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "server storage quota exceeded; delete old versions or raise max-total-storage".into(),
+        ));
     }
     let rev = id(12);
     let version = row.next;
@@ -484,10 +673,14 @@ async fn update(
     let expiry = match result {
         Ok(expiry) => expiry,
         Err(e) => {
-            let _ = fs::remove_dir_all(&root);
+            if root.exists() && fs::remove_dir_all(&root).is_err() {
+                s.quota_poisoned = true;
+            }
             return Err(e.into());
         }
     };
+    s.quota_used = next_all_bytes;
+    s.project_quota_used.insert(p.clone(), next_project_bytes);
     Ok(Json(
         json!({"project":p,"revision":rev,"version":version,"version_url":format!("{}/s/{p}/versions/{version}/",s.public_url),"files":desired.len(),"bytes":total,"url":format!("{}/s/{p}/",s.public_url),"expires_at":expiry.map(|e|e.expires_at)}),
     ))
@@ -498,7 +691,7 @@ async fn delete_project(
     Path(p): Path<String>,
     h: HeaderMap,
 ) -> ApiResult {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
     auth(&s, &h, Some(&p), "write")?;
     project(&s, &p)?;
     s.db.execute("DELETE FROM projects WHERE id=?1", [&p])
@@ -506,6 +699,9 @@ async fn delete_project(
     let root = s.root.join("projects").join(&p);
     if root.exists() {
         fs::remove_dir_all(root).map_err(anyhow::Error::from)?;
+    }
+    if let Some(used) = s.project_quota_used.remove(&p) {
+        s.quota_used = s.quota_used.saturating_sub(used);
     }
     Ok(Json(json!({"deleted":p})))
 }
@@ -521,6 +717,7 @@ struct PatchProject {
     name: Option<String>,
     auth: Option<PatchAccess>,
     expires_in: Option<String>,
+    max_storage: Option<String>,
     on_expire: Option<ExpiryAction>,
 }
 async fn config(
@@ -535,9 +732,12 @@ async fn config(
     if body.name.is_none()
         && body.auth.is_none()
         && body.expires_in.is_none()
+        && body.max_storage.is_none()
         && body.on_expire.is_none()
     {
-        return Err(bad("specify name, auth, expires_in, or on_expire"));
+        return Err(bad(
+            "specify name, auth, expires_in, max_storage, or on_expire",
+        ));
     }
     let mut access = row.access;
     if let Some(a) = body.auth {
@@ -549,6 +749,13 @@ async fn config(
         }
     }
     let name = body.name.unwrap_or(row.name);
+    let max_storage = body
+        .max_storage
+        .as_deref()
+        .map(storage_size)
+        .transpose()
+        .map_err(|_| bad("invalid max_storage"))?
+        .unwrap_or(row.max_storage);
     if name.len() > 256 {
         return Err(bad("name too long"));
     }
@@ -561,12 +768,13 @@ async fn config(
     };
     let tx = s.db.transaction().map_err(anyhow::Error::from)?;
     tx.execute(
-        "UPDATE projects SET name=?1,auth=?2,on_expire=?3 WHERE id=?4",
+        "UPDATE projects SET name=?1,auth=?2,max_storage=?3,on_expire=?4 WHERE id=?5",
         params![
             name,
             serde_json::to_string(&access).map_err(anyhow::Error::from)?,
+            max_storage,
             on_expire,
-            p
+            p,
         ],
     )
     .map_err(anyhow::Error::from)?;
@@ -583,7 +791,7 @@ async fn config(
     }
     tx.commit().map_err(anyhow::Error::from)?;
     Ok(Json(
-        json!({"project":p,"updated":true,"expires_at":expiry.map(|e|e.expires_at),"expires_in_seconds":expiry.map(|e|e.lifetime),"on_expire":on_expire}),
+        json!({"project":p,"updated":true,"expires_at":expiry.map(|e|e.expires_at),"expires_in_seconds":expiry.map(|e|e.lifetime),"max_storage_bytes":max_storage,"on_expire":on_expire}),
     ))
 }
 fn access_summary(rule: &StoredRule, admin: bool) -> Value {
@@ -620,6 +828,11 @@ async fn info(State(state): State<Shared>, Path(p): Path<String>, h: HeaderMap) 
     result["files"] = json!(current_files);
     result["bytes"] = json!(current_bytes);
     result["storage_bytes"] = json!(total_bytes);
+    result["quota_used_bytes"] = json!(s
+        .project_quota_used
+        .get(&p)
+        .copied()
+        .context("missing project quota state")?);
     result["auth"] = json!({"view":access_summary(&row.access.view,s.admin.is_some()),"write":access_summary(&row.access.write,s.admin.is_some())});
     Ok(Json(result))
 }
@@ -627,7 +840,7 @@ async fn status(State(state): State<Shared>, h: HeaderMap) -> ApiResult {
     let s = state.lock().unwrap();
     auth(&s, &h, None, "admin")?;
     Ok(Json(
-        json!({"version":env!("CARGO_PKG_VERSION"),"authentication_required":s.admin.is_some(),"default_expires_in_seconds":s.default_lifetime,"default_on_expire":s.default_on_expire}),
+        json!({"version":env!("CARGO_PKG_VERSION"),"authentication_required":s.admin.is_some(),"default_expires_in_seconds":s.default_lifetime,"max_total_storage_bytes":s.max_total_storage,"quota_used_bytes":s.quota_used,"default_on_expire":s.default_on_expire}),
     ))
 }
 async fn snapshot_file(
@@ -660,7 +873,7 @@ async fn snapshot_file(
     )
         .into_response())
 }
-fn purge_expired(s: &Store) -> Result<()> {
+fn purge_expired(s: &mut Store) -> Result<()> {
     let mut q =
         s.db.prepare("SELECT project FROM expiry JOIN projects ON projects.id=expiry.project WHERE expires_at <= ?1 AND on_expire=?2")?;
     let ids = q
@@ -679,6 +892,8 @@ fn purge_expired(s: &Store) -> Result<()> {
         })();
         if let Err(e) = result {
             eprintln!("expiry cleanup failed for {p}; will retry: {e}");
+        } else if let Some(used) = s.project_quota_used.remove(&p) {
+            s.quota_used = s.quota_used.saturating_sub(used);
         }
     }
     Ok(())
@@ -750,7 +965,7 @@ async fn delete_version(
     Path((p, n)): Path<(String, u64)>,
     h: HeaderMap,
 ) -> ApiResult {
-    let s = state.lock().unwrap();
+    let mut s = state.lock().unwrap();
     auth(&s, &h, Some(&p), "write")?;
     let row = project(&s, &p)?;
     has_version(&s, &p, n)?;
@@ -760,13 +975,20 @@ async fn delete_version(
             "cannot delete the current version".into(),
         ));
     }
+    let path = s.root.join("projects").join(&p).join(n.to_string());
+    let charge = VERSION_CHARGE
+        .checked_add(quota_used(&path, usize::MAX)?)
+        .context("version charge overflow")?;
     s.db.execute(
         "DELETE FROM versions WHERE project=?1 AND number=?2",
         params![p, n],
     )
     .map_err(anyhow::Error::from)?;
-    fs::remove_dir_all(s.root.join("projects").join(&p).join(n.to_string()))
-        .map_err(anyhow::Error::from)?;
+    fs::remove_dir_all(path).map_err(anyhow::Error::from)?;
+    s.quota_used = s.quota_used.saturating_sub(charge);
+    if let Some(used) = s.project_quota_used.get_mut(&p) {
+        *used = used.saturating_sub(charge);
+    }
     Ok(Json(json!({"project":p,"deleted_version":n})))
 }
 async fn static_root(State(s): State<Shared>, Path(p): Path<String>, h: HeaderMap) -> Response {
@@ -839,14 +1061,29 @@ fn static_file(state: Shared, p: String, path: String, h: HeaderMap) -> Response
     )
         .into_response()
 }
+pub struct ServeOptions<'a> {
+    pub default_expires_in: &'a str,
+    pub default_on_expire: ExpiryAction,
+    pub request_timeout: std::time::Duration,
+    pub max_total_storage: &'a str,
+}
+
 pub async fn serve(
     listen: std::net::SocketAddr,
     root: &FsPath,
     url: &str,
     credential: Option<&str>,
-    default_expires_in: &str,
-    default_on_expire: ExpiryAction,
+    options: ServeOptions<'_>,
 ) -> Result<()> {
+    let ServeOptions {
+        default_expires_in,
+        default_on_expire,
+        request_timeout,
+        max_total_storage,
+    } = options;
+    if request_timeout.is_zero() {
+        bail!("request timeout must be positive")
+    }
     let parsed = url::Url::parse(url)?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -870,7 +1107,8 @@ pub async fn serve(
     let mut store = open(root, url, credential)?;
     store.default_lifetime = crate::expiry::duration(default_expires_in)?;
     store.default_on_expire = default_on_expire;
-    purge_expired(&store)?;
+    store.max_total_storage = storage_size(max_total_storage)?;
+    purge_expired(&mut store)?;
     // Only remove uncommitted or deleted versions; retained snapshots survive restarts.
     for entry in fs::read_dir(root.join("projects"))? {
         let entry = entry?;
@@ -901,13 +1139,14 @@ pub async fn serve(
             fs::remove_dir(entry.path())?
         }
     }
+    rebuild_quota(&mut store)?;
     let state = Arc::new(Mutex::new(store));
     let cleanup = state.clone();
     let janitor = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
-            if let Err(e) = purge_expired(&cleanup.lock().unwrap()) {
+            if let Err(e) = purge_expired(&mut cleanup.lock().unwrap()) {
                 eprintln!("expiry cleanup failed: {e}");
             }
         }
@@ -946,7 +1185,12 @@ pub async fn serve(
                         return (StatusCode::SERVICE_UNAVAILABLE, "server busy; retry")
                             .into_response();
                     };
-                    next.run(request).await
+                    match tokio::time::timeout(request_timeout, next.run(request)).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            (StatusCode::REQUEST_TIMEOUT, "request timed out").into_response()
+                        }
+                    }
                 }
             },
         ))
@@ -960,4 +1204,53 @@ pub async fn serve(
         .await?;
     janitor.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_sizes_reject_zero_and_overflow() {
+        assert_eq!(storage_size("500MiB").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(storage_size("10GiB").unwrap(), 10 * 1024 * 1024 * 1024);
+        for value in ["0B", "-1B", "1MB", "1.5MiB", "9223372036854775808B"] {
+            assert!(storage_size(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn upgrades_existing_projects_without_deleting_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Connection::open(dir.path().join("sss.db")).unwrap();
+        db.execute_batch("CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,revision TEXT NOT NULL,current INTEGER NOT NULL DEFAULT 0,next INTEGER NOT NULL DEFAULT 1,auth TEXT NOT NULL); CREATE TABLE versions(project TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,number INTEGER NOT NULL,PRIMARY KEY(project,number)); PRAGMA user_version=2;").unwrap();
+        db.execute(
+            "INSERT INTO projects(id,name,revision,current,next,auth) VALUES('abc','existing','rev',1,2,?1)",
+            [serde_json::to_string(&Access::default().store().unwrap()).unwrap()],
+        )
+        .unwrap();
+        db.execute("INSERT INTO versions(project,number) VALUES('abc',1)", [])
+            .unwrap();
+        drop(db);
+
+        let store = open(dir.path(), "http://localhost:8080", None).unwrap();
+        assert_eq!(
+            project(&store, "abc").unwrap().max_storage,
+            500 * 1024 * 1024
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM versions", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            4
+        );
+    }
 }

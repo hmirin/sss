@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
+    name = "sss",
     version,
     about = "Simple Static Server: publish static files from any machine",
     subcommand_required = false
@@ -52,6 +53,12 @@ pub enum Command {
         /// Default cleanup action at expiration for new projects.
         #[arg(long, env = "SSS_DEFAULT_ON_EXPIRE", default_value = "delete")]
         default_on_expire: expiry::ExpiryAction,
+        /// Maximum time to process one request, including receiving its body.
+        #[arg(long, env = "SSS_REQUEST_TIMEOUT_SECONDS", default_value_t = 180)]
+        request_timeout_seconds: u64,
+        /// Maximum charged storage across all projects.
+        #[arg(long, env = "SSS_MAX_TOTAL_STORAGE", default_value = "10GiB")]
+        max_total_storage: String,
     },
     /// Create a project. Does not change the working directory or save credentials.
     New(ProjectArgs),
@@ -79,7 +86,7 @@ pub enum Command {
     },
     /// Delete selected files, or the entire project when no files are specified.
     Delete { files: Vec<String> },
-    /// Change project name, authentication, or expiration (shared authentication).
+    /// Change project name, authentication, expiration, or storage limit (shared authentication).
     Config(ProjectArgs),
     /// List retained versions.
     Versions,
@@ -103,6 +110,9 @@ pub struct ProjectArgs {
     /// Delete expired content or retain it in storage while keeping it inaccessible.
     #[arg(long)]
     pub on_expire: Option<expiry::ExpiryAction>,
+    /// Maximum charged storage for this project.
+    #[arg(long)]
+    pub max_storage: Option<String>,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long = "basic_auth_view")]
@@ -125,6 +135,8 @@ async fn main() {
             public_url,
             default_expires_in,
             default_on_expire,
+            request_timeout_seconds,
+            max_total_storage,
         }) => match data_dir.clone().map(Ok).unwrap_or_else(default_data_dir) {
             Ok(root) => {
                 let url = public_url
@@ -135,8 +147,12 @@ async fn main() {
                     &root,
                     &url,
                     cli.basic_auth.as_deref(),
-                    default_expires_in,
-                    *default_on_expire,
+                    server::ServeOptions {
+                        default_expires_in,
+                        default_on_expire: *default_on_expire,
+                        request_timeout: std::time::Duration::from_secs(*request_timeout_seconds),
+                        max_total_storage,
+                    },
                 )
                 .await
             }
