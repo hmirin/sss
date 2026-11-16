@@ -11,6 +11,12 @@ View artifacts created by Codex, Claude, or other agents from any computer or mo
 
 ## Quick Start
 
+Install the `sss` command with Cargo:
+
+```sh
+cargo install simple-static-server --locked
+```
+
 > [!TIP]
 > TL;DR: Just ask your agent to:
 > ```text

@@ -1,9 +1,15 @@
 [package]
-name = "sss"
-version = "0.1.2"
+name = "simple-static-server"
+version = "0.1.3"
 edition = "2021"
 description = "Simple Static Server: atomic static publishing in one binary"
 license = "MIT"
+repository = "https://github.com/hmirin/sss"
+homepage = "https://combinatrix.ai/sss/"
+
+[[bin]]
+name = "sss"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -30,4 +36,4 @@ tempfile = "3"
 semver = "1"
 flate2 = "1"
 tar = "0.4"
-attestation-verify = { git = "https://github.com/combinatrix-ai/attestation-verify", rev = "73d3b53ecbf2d3c71846ae4cab3fa6482be012eb" }
+attestation-verify = "0.1.0"

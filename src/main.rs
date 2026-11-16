@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
+    name = "sss",
     version,
     about = "Simple Static Server: publish static files from any machine",
     subcommand_required = false
