@@ -383,6 +383,7 @@ def exercise_storage_quota():
 
 
 if __name__ == '__main__':
+    assert subprocess.check_output([BINARY, '--version'], text=True).startswith('sss ')
     exercise(None)
     exercise('admin:shared-password')
     exercise_request_timeout()
