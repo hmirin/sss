@@ -254,14 +254,14 @@ sss serve
 
 This shared credential protects project creation, global listing, project settings changes, and, by default, all project viewing and editing. It can administer every active project. If `SSS_BASIC_AUTH` is unset, server-wide operations require no authentication and projects inherit that default.
 
-Projects inherit this authentication by default. You can override viewing and editing access for individual projects.
+Projects inherit this authentication by default. To make new projects viewable without credentials while keeping inherited editing protected, start the server with `sss serve --default-view-auth none` or set `SSS_DEFAULT_VIEW_AUTH=none`. This changes only the viewing rule of new projects that omit it. Explicit project rules and existing projects are unchanged. The configured network boundary still applies.
 
 > [!CAUTION]
 > Use HTTPS when sending Basic authentication credentials over a network. Basic authentication does not encrypt credentials. See [Hosting](#hosting).
 
 ### Per-Project Settings
 
-Projects inherit the server's shared Basic authentication for both viewing and editing. Set project access rules directly when creating a project:
+New projects inherit the server's shared Basic authentication for editing. Viewing uses the server's `--default-view-auth` setting, which defaults to `inherit`. Set project access rules directly when creating a project:
 
 ```sh
 sss new --name hello --basic_auth_view none --basic_auth_write none
@@ -271,7 +271,7 @@ Each option accepts `inherit`, `none`, or `username:password`:
 
 | Value | Behavior |
 |---|---|
-| `inherit` | Use the server's shared authentication. This is the default when the option is omitted. |
+| `inherit` | Use the server's shared authentication. This remains explicit even when the server viewing default is `none`. |
 | `none` | Allow the operation without authentication. |
 | `username:password` | Set project-specific Basic authentication for the operation. |
 
@@ -314,15 +314,15 @@ You can also provide the same project settings as JSON:
 sss new --config project.json
 ```
 
-Explicit `--basic_auth_view` and `--basic_auth_write` options override the corresponding JSON settings. If neither a CLI option nor a JSON setting is provided, that operation uses `inherit`.
+Explicit `--basic_auth_view` and `--basic_auth_write` options override the corresponding JSON settings. If neither a CLI option nor a JSON setting supplies a viewing rule, creation uses the server's `--default-view-auth` setting. An omitted editing rule uses `inherit`.
 
 | Mode | Behavior |
 |---|---|
-| `inherit` | Use the server's `SSS_BASIC_AUTH`, or no authentication if it is unset. This is the default when a setting is omitted. |
+| `inherit` | Use the server's `SSS_BASIC_AUTH`, or no authentication if it is unset. |
 | `none` | Explicitly disable authentication for this project operation, even if a server default is set. |
 | `basic` | Use the project's specified username and password. |
 
-Both viewing and editing support all three modes. Project-specific credentials authorize only the configured operation on that project; they do not grant server-wide administration. The server's shared credential retains access to every active project, including projects with overrides.
+Both viewing and editing support all three modes. Project-specific credentials authorize only the configured operation on that project; they do not grant server-wide administration. The server's shared credential retains access to every active project, including projects with overrides. Keep viewing passwords separate from shared administration credentials.
 
 Creating projects, listing all projects, and changing project settings use the server's shared authentication. If it is unset, those operations remain unauthenticated even when a project has its own password. Set `SSS_BASIC_AUTH` on the server if you need to protect those operations.
 

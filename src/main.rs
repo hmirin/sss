@@ -50,6 +50,14 @@ pub enum Command {
         /// Default idle lifetime for new projects (e.g. 7d, 12h, or none).
         #[arg(long, env = "SSS_DEFAULT_EXPIRES_IN", default_value = "none")]
         default_expires_in: String,
+        /// Viewing policy for new projects when no viewing rule is supplied.
+        #[arg(
+            long,
+            env = "SSS_DEFAULT_VIEW_AUTH",
+            value_enum,
+            default_value = "inherit"
+        )]
+        default_view_auth: auth::DefaultViewAuth,
         /// Default cleanup action at expiration for new projects.
         #[arg(long, env = "SSS_DEFAULT_ON_EXPIRE", default_value = "delete")]
         default_on_expire: expiry::ExpiryAction,
@@ -134,6 +142,7 @@ async fn main() {
             data_dir,
             public_url,
             default_expires_in,
+            default_view_auth,
             default_on_expire,
             request_timeout_seconds,
             max_total_storage,
@@ -150,6 +159,7 @@ async fn main() {
                     server::ServeOptions {
                         default_expires_in,
                         default_on_expire: *default_on_expire,
+                        default_view_auth: *default_view_auth,
                         request_timeout: std::time::Duration::from_secs(*request_timeout_seconds),
                         max_total_storage,
                     },

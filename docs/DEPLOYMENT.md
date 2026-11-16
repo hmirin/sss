@@ -14,6 +14,10 @@ SSS_PUBLIC_URL=https://sss.example
 
 Optionally add `SSS_BASIC_AUTH=user:password`; restrict the environment file to its administrator. The unit sets `--data-dir /var/lib/sss` and runs as the `sss` user. Do not expose or commit credentials.
 
+## Default Viewing Authentication
+
+Set `SSS_DEFAULT_VIEW_AUTH=none` (or `--default-view-auth none`) to make new projects viewable without credentials when their creation request omits `auth.view`. The product default is `inherit`. Explicit project rules override this default, and existing projects are unchanged. Editing defaults to `inherit`; configure `SSS_BASIC_AUTH` to protect administration and inherited editing. Viewing without credentials still respects the configured network boundary. Use separate credentials for project viewing and server administration, and keep administration credentials out of viewing browsers.
+
 ## Default Project Lifetime
 
 Set `SSS_DEFAULT_EXPIRES_IN=7d` or `--default-expires-in 7d` to give new projects a default idle lifetime. The default is `none`. Projects can override it on creation and administrators can change or remove expiration with `sss config --expires-in`. The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it. Name or authentication changes, reads, and deleting an old version do not renew it. Existing projects are unaffected by server default changes.

@@ -388,6 +388,8 @@ if __name__ == '__main__':
     exercise('admin:shared-password')
     exercise_request_timeout()
     exercise_storage_quota()
+    from default_view import exercise_default_view
+    exercise_default_view(BINARY)
     from features import exercise_features
     exercise_features(BINARY)
     skill = subprocess.check_output([BINARY, '--skill'], text=True)

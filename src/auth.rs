@@ -5,6 +5,22 @@ use argon2::{
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Default, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultViewAuth {
+    #[default]
+    Inherit,
+    None,
+}
+impl From<DefaultViewAuth> for Rule {
+    fn from(value: DefaultViewAuth) -> Self {
+        match value {
+            DefaultViewAuth::Inherit => Self::Inherit,
+            DefaultViewAuth::None => Self::None,
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Rule {
