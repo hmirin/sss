@@ -381,6 +381,8 @@ Give the output to your agent, or save it as `SKILL.md` in your agent's skill di
 
 By default, `sss serve` creates `~/.sss` and stores its configuration, project metadata, and version files there. Use `--data-dir` or `SSS_DATA_DIR` to choose another location. Back up the entire data directory to preserve projects and their versions.
 
+Retained storage quotas default to 10 GiB across the server and 500 MiB per project. Use `sss serve --max-total-storage 10GiB` for the server limit and `sss config --project ID --max-storage 500MiB` for a project's limit. When a publish would exceed either limit, it is rejected without deleting old versions. Quota accounting includes reserves for versions, directories, and files so empty snapshots consume quota. See [CLI storage limits](docs/CLI.md#publish) for details.
+
 ## Build and Check
 
 ```sh

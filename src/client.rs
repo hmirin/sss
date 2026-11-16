@@ -56,6 +56,9 @@ fn project_body(args: &ProjectArgs) -> Result<Value> {
         crate::expiry::duration(value)?;
         body["expires_in"] = json!(value);
     }
+    if let Some(value) = &args.max_storage {
+        body["max_storage"] = json!(value);
+    }
     if let Some(name) = &args.name {
         body["name"] = json!(name)
     }
@@ -84,7 +87,53 @@ fn matcher(root: &Path) -> Result<Gitignore> {
     }
     Ok(b.build()?)
 }
+fn open_source(root: &fs::File, relative: &Path) -> Result<fs::File> {
+    use rustix::fs::{openat, Mode, OFlags};
+
+    let parts: Vec<_> = relative
+        .components()
+        .filter_map(|part| match part {
+            Component::CurDir => None,
+            other => Some(other),
+        })
+        .collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        bail!("source path must be relative")
+    }
+    let mut dir = root.try_clone()?;
+    for (index, part) in parts.iter().enumerate() {
+        let Component::Normal(name) = part else {
+            unreachable!()
+        };
+        let last = index + 1 == parts.len();
+        let flags = if last {
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+        } else {
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        };
+        let opened = fs::File::from(openat(&dir, Path::new(name), flags, Mode::empty())?);
+        if last {
+            if !opened.metadata()?.is_file() {
+                bail!("source must be a regular file")
+            }
+            return Ok(opened);
+        }
+        dir = opened;
+    }
+    unreachable!()
+}
 fn collect(root: &Path, inputs: &[PathBuf], directory: bool) -> Result<BTreeMap<String, Vec<u8>>> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let root_file = fs::File::from(open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
     let mut result = BTreeMap::new();
     let rules = matcher(root)?;
     let mut total = 0usize;
@@ -99,16 +148,14 @@ fn collect(root: &Path, inputs: &[PathBuf], directory: bool) -> Result<BTreeMap<
             }
             bail!("excluded path: {name}")
         };
-        if fs::symlink_metadata(path)?.file_type().is_symlink() {
-            bail!("symlinks are not allowed: {name}")
-        };
+        let file = open_source(&root_file, relative)
+            .with_context(|| format!("cannot safely open source: {name}"))?;
         let limit = 50 * 1024 * 1024;
-        if fs::metadata(path)?.len() > (limit - total) as u64 {
+        if file.metadata()?.len() > (limit - total) as u64 {
             bail!("project upload exceeds quota");
         }
         let mut bytes = Vec::new();
-        fs::File::open(path)?
-            .take((limit - total + 1) as u64)
+        file.take((limit - total + 1) as u64)
             .read_to_end(&mut bytes)?;
         total += bytes.len();
         if total > 50 * 1024 * 1024 || result.len() >= 5000 {
@@ -118,12 +165,6 @@ fn collect(root: &Path, inputs: &[PathBuf], directory: bool) -> Result<BTreeMap<
         Ok(())
     };
     if directory {
-        if !fs::symlink_metadata(root)?.is_dir() {
-            bail!("sync source must be a directory")
-        }
-        if fs::symlink_metadata(root)?.file_type().is_symlink() {
-            bail!("sync root must not be a symlink")
-        };
         for e in walkdir::WalkDir::new(root)
             .follow_links(false)
             .into_iter()
@@ -157,17 +198,6 @@ fn collect(root: &Path, inputs: &[PathBuf], directory: bool) -> Result<BTreeMap<
                 bail!("upload paths must be relative to the current directory")
             };
             let path = root.join(input);
-            let canonical = path.canonicalize()?;
-            if !canonical.starts_with(root.canonicalize()?) {
-                bail!("path escapes directory")
-            };
-            let mut check = root.to_path_buf();
-            for component in input.components() {
-                check.push(component);
-                if fs::symlink_metadata(&check)?.file_type().is_symlink() {
-                    bail!("symlinks are not allowed")
-                }
-            }
             let relative = input
                 .components()
                 .filter(|c| !matches!(c, Component::CurDir))
@@ -598,5 +628,53 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/etc/passwd", t.path().join("link")).unwrap();
         assert!(collect(t.path(), &[], true).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn source_descriptor_stays_inside_pinned_root() {
+        use rustix::fs::{open, Mode, OFlags};
+        use std::os::unix::fs::symlink;
+
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("site");
+        let outside = t.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(root.join("assets")).unwrap();
+        fs::write(root.join("assets/app.js"), b"safe").unwrap();
+        fs::write(outside.join("app.js"), b"secret").unwrap();
+        let explicit = [PathBuf::from("assets/app.js")];
+        assert_eq!(
+            collect(&root, &explicit, false).unwrap()["assets/app.js"],
+            b"safe"
+        );
+        let root_fd = fs::File::from(
+            open(
+                &root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+
+        let mut opened = open_source(&root_fd, Path::new("assets/app.js")).unwrap();
+        fs::rename(root.join("assets/app.js"), root.join("assets/old.js")).unwrap();
+        symlink(outside.join("app.js"), root.join("assets/app.js")).unwrap();
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"safe");
+        assert!(open_source(&root_fd, Path::new("assets/app.js")).is_err());
+
+        fs::rename(root.join("assets"), root.join("old-assets")).unwrap();
+        symlink(&outside, root.join("assets")).unwrap();
+        assert!(open_source(&root_fd, Path::new("assets/app.js")).is_err());
+        assert!(collect(&root, &explicit, false).is_err());
+
+        fs::rename(&root, t.path().join("old-site")).unwrap();
+        symlink(&outside, &root).unwrap();
+        let mut original = open_source(&root_fd, Path::new("old-assets/old.js")).unwrap();
+        bytes.clear();
+        original.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"safe");
     }
 }

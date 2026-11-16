@@ -18,6 +18,7 @@ Flags override environment variables. Project selection is explicit and never fo
 sss new --name hello
 sss list
 sss new --name public --basic_auth_view none --basic_auth_write none
+sss new --name small --max-storage 500MiB
 sss new --config project.json
 sss new --config -
 ```
@@ -26,7 +27,7 @@ sss new --config -
 
 `list` returns project entries with `id`, `name`, `version`, `expires_in_seconds`, and `expires_at`.
 
-JSON config accepts `name`, `expires_in`, and `auth.view` / `auth.write`. Each auth object has `mode: inherit`, `mode: none`, or `mode: basic` with `username` and `password`. Explicit flags override the corresponding JSON fields.
+JSON config accepts `name`, `expires_in`, `max_storage`, and `auth.view` / `auth.write`. Each auth object has `mode: inherit`, `mode: none`, or `mode: basic` with `username` and `password`. Explicit flags override the corresponding JSON fields. New projects default to a 500 MiB charged-storage quota across all versions.
 
 Creation and listing use the server's shared authentication. An unset server credential leaves these operations open.
 
@@ -45,7 +46,7 @@ Dry-run returns `added`, `modified`, and `deleted` paths without creating a vers
 
 `.sssignore` follows gitignore syntax. Hidden paths, `node_modules`, `target`, `.pem`, and `.key` files are excluded. Symlinks are rejected. The top-level `versions/` path is reserved. Use relative asset URLs.
 
-Limits per snapshot: 50 MiB decoded content, 5,000 files, 1,024 bytes per relative UTF-8 path. HTTP request limit: 72 MiB. Retained versions consume disk until explicitly deleted.
+Limits per snapshot: 50 MiB decoded content, 5,000 files, 1,024 bytes per relative UTF-8 path. HTTP request limit: 72 MiB. Retained versions consume disk until explicitly deleted. Quota defaults are 500 MiB per project and 10 GiB across the server. Quota usage reserves 4 KiB per project for metadata, 64 KiB per version, 4 KiB per directory, and 4 KiB per file plus its content rounded up to 4 KiB. This bounds empty projects, empty versions, and tiny-file uploads; it is a conservative accounting value, not measured disk allocation. Other data-dir files are outside the quota.
 
 ## Versions and Deletion
 
@@ -67,25 +68,31 @@ Every snapshot uses current project authentication. Publication is atomic on the
 ```sh
 sss config --project ID --basic_auth_view none
 sss config --project ID --basic_auth_write inherit
+sss config --project ID --max-storage 500MiB
 sss config --project ID --config project-auth.json
 ```
 
-The JSON object contains `auth` just as on creation. Only supplied fields change. This command requires shared server credentials when configured; project editing credentials do not authorize it. Use `--name` to rename a project and `--expires-in` to set its idle lifetime or `none` to disable expiration.
+The JSON object contains `auth` just as on creation. Only supplied fields change. This command requires shared server credentials when configured; project editing credentials do not authorize it. Use `--name` to rename a project, `--expires-in` to set its idle lifetime or `none` to disable expiration, and `--max-storage` to change the charged-storage quota. Size values are positive whole numbers followed by `B`, `KiB`, `MiB`, or `GiB`. Lowering the limit below current usage keeps existing versions but blocks further publication until space is freed or the limit is raised.
 
 ## Server
 
 ```sh
 sss serve
 sss serve --listen 127.0.0.1 --port 8080 --data-dir /var/lib/sss --public-url https://sss.example
+sss serve --max-total-storage 10GiB
 ```
 
 | Option | Environment | Default |
 |---|---|---|
 | `--listen` | `SSS_LISTEN` | `127.0.0.1` |
 | `--default-expires-in` | `SSS_DEFAULT_EXPIRES_IN` | `none` |
+| `--request-timeout-seconds` | `SSS_REQUEST_TIMEOUT_SECONDS` | `180` |
+| `--max-total-storage` | `SSS_MAX_TOTAL_STORAGE` | `10GiB` |
 | `--port` | `SSS_PORT` | `8080` |
 | `--data-dir` | `SSS_DATA_DIR` | `~/.sss` |
 | `--public-url` | `SSS_PUBLIC_URL` | `http://localhost:<port>` |
+
+The request timeout includes receiving the body. When it expires, the server returns HTTP 408 and releases the request's concurrency slot. Set a higher value if legitimate uploads need more than three minutes.
 
 `SSS_BASIC_AUTH` configures shared server authentication. It covers administration and inherited project access. Explicit project `none` and `basic` override inheritance. Shared credentials retain access to all projects. Only hashes of project passwords are stored; server environment credentials are hashed in memory.
 
@@ -112,7 +119,7 @@ sss doctor --project a1b2c3
 sss diff ./public --project a1b2c3
 ```
 
-`info` returns the project URL, current version, current file count and bytes, total stored bytes across versions, viewing/editing policies, `expires_in_seconds`, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_in_seconds` is the idle lifetime, or `null` for no expiration. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration.
+`info` returns the project URL, current version, current file count and bytes, total file payload `storage_bytes` across versions, charged `quota_used_bytes`, `max_storage_bytes`, viewing/editing policies, `expires_in_seconds`, and `expires_at`. It requires editing access and never returns passwords or hashes. `expires_in_seconds` is the idle lifetime, or `null` for no expiration. `expires_at` is a Unix timestamp in seconds, or `null` for no expiration. `/api/status` returns server `quota_used_bytes` and `max_total_storage_bytes` to shared administrators.
 
 `doctor` reports the selected upstream, client/server versions, reachability, and authentication checks as JSON. Without a project it checks shared administration access; with `--project` it checks editing access to that project. It makes no changes and exits nonzero when a check fails.
 

@@ -110,7 +110,7 @@ Use the deployment's external URL as `--public-url`. Preserve the data directory
 
 ## Inspect, Compare, and Diagnose
 
-- `sss info --project ID`: URLs, version, current file count/bytes, total storage_bytes, authentication modes, expires_in_seconds (integer or null), and expires_at (Unix seconds or null). Requires editing access; no passwords or hashes are returned.
+- `sss info --project ID`: URLs, version, current file count/bytes, total payload storage_bytes, charged quota_used_bytes, max_storage_bytes, authentication modes, expires_in_seconds (integer or null), and expires_at (Unix seconds or null). Requires editing access; no passwords or hashes are returned.
 - `sss doctor [--project ID]`: read-only JSON connectivity/version/authentication checks. Without a project, checks shared admin access; with a project, checks edit access. A failed check exits nonzero.
 - `sss diff ./public --project ID`: read-only JSON changes with unified text patches. Binary, non-UTF-8, and file pairs over 1 MiB omit content and report sizes. Requires editing access. Retry if the server revision changed.
 - `sss sync ./public --project ID --watch`: initial sync then poll every 250 ms and publish after 750 ms of quiet. Prints JSON lines per publication. Ctrl-C stops it. Cannot combine with --dry-run. Local scan errors pause publication; server errors and revision conflicts stop the watcher. Local content is authoritative for each new batch, so coordinate simultaneous editors.
@@ -123,8 +123,11 @@ sss new --name preview --expires-in 1d
 sss config --project ID --expires-in 30d
 sss config --project ID --expires-in none
 sss config --project ID --name renamed --basic_auth_view none --expires-in 7d
+sss config --project ID --max-storage 500MiB
 ```
 
 The server also reads `SSS_DEFAULT_EXPIRES_IN`; the default is `none`. Accept positive whole numbers followed by s/m/h/d/w, or none. JSON settings use `expires_in` alongside name and auth; CLI flags take precedence. New projects inherit the server default when omitted; config preserves the current lifetime and deadline when omitted. The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it. Name or authentication changes, reads, and deleting an old version do not renew it. Changing the server default does not change existing projects.
 
 Expiration deletes the project and every version. At the deadline all project URLs become unavailable; cleanup runs on startup and every 30 seconds. Expired projects cannot be revived. Reuse the user's agreed retention policy; do not invent a finite lifetime for permanent artifacts. Check expires_at with info/list. Changes to authentication, name, and expiration use shared administration authentication.
+
+Retained storage quotas default to 500 MiB per project and 10 GiB for the server. Operators can change the global limit with `sss serve --max-total-storage SIZE` or `SSS_MAX_TOTAL_STORAGE`, and project administrators can set `sss new --max-storage SIZE` or `sss config --project ID --max-storage SIZE`. Sizes use B, KiB, MiB, or GiB. Quota usage includes reserves for versions, directories, and files, so even empty versions consume quota. A publish that exceeds either limit fails without deleting old versions; use `sss delete-version` or ask the administrator to adjust the limit. Project limit changes require shared administration authentication.

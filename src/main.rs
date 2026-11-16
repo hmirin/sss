@@ -49,6 +49,12 @@ pub enum Command {
         /// Default idle lifetime for new projects (e.g. 7d, 12h, or none).
         #[arg(long, env = "SSS_DEFAULT_EXPIRES_IN", default_value = "none")]
         default_expires_in: String,
+        /// Maximum time to process one request, including receiving its body.
+        #[arg(long, env = "SSS_REQUEST_TIMEOUT_SECONDS", default_value_t = 180)]
+        request_timeout_seconds: u64,
+        /// Maximum charged storage across all projects.
+        #[arg(long, env = "SSS_MAX_TOTAL_STORAGE", default_value = "10GiB")]
+        max_total_storage: String,
     },
     /// Create a project. Does not change the working directory or save credentials.
     New(ProjectArgs),
@@ -76,7 +82,7 @@ pub enum Command {
     },
     /// Delete selected files, or the entire project when no files are specified.
     Delete { files: Vec<String> },
-    /// Change project name, authentication, or expiration (shared authentication).
+    /// Change project name, authentication, expiration, or storage limit (shared authentication).
     Config(ProjectArgs),
     /// List retained versions.
     Versions,
@@ -97,6 +103,9 @@ pub struct ProjectArgs {
     /// Idle lifetime; resets on publish, rollback, or setting it (e.g. 7d, 12h, or none).
     #[arg(long)]
     pub expires_in: Option<String>,
+    /// Maximum charged storage for this project.
+    #[arg(long)]
+    pub max_storage: Option<String>,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long = "basic_auth_view")]
@@ -118,6 +127,8 @@ async fn main() {
             data_dir,
             public_url,
             default_expires_in,
+            request_timeout_seconds,
+            max_total_storage,
         }) => match data_dir.clone().map(Ok).unwrap_or_else(default_data_dir) {
             Ok(root) => {
                 let url = public_url
@@ -129,6 +140,8 @@ async fn main() {
                     &url,
                     cli.basic_auth.as_deref(),
                     default_expires_in,
+                    std::time::Duration::from_secs(*request_timeout_seconds),
+                    max_total_storage,
                 )
                 .await
             }
