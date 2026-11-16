@@ -50,6 +50,9 @@ pub enum Command {
         /// Default idle lifetime for new projects (e.g. 7d, 12h, or none).
         #[arg(long, env = "SSS_DEFAULT_EXPIRES_IN", default_value = "none")]
         default_expires_in: String,
+        /// Default cleanup action at expiration for new projects.
+        #[arg(long, env = "SSS_DEFAULT_ON_EXPIRE", default_value = "delete")]
+        default_on_expire: expiry::ExpiryAction,
         /// Maximum time to process one request, including receiving its body.
         #[arg(long, env = "SSS_REQUEST_TIMEOUT_SECONDS", default_value_t = 180)]
         request_timeout_seconds: u64,
@@ -104,6 +107,9 @@ pub struct ProjectArgs {
     /// Idle lifetime; resets on publish, rollback, or setting it (e.g. 7d, 12h, or none).
     #[arg(long)]
     pub expires_in: Option<String>,
+    /// Delete expired content or retain it in storage while keeping it inaccessible.
+    #[arg(long)]
+    pub on_expire: Option<expiry::ExpiryAction>,
     /// Maximum charged storage for this project.
     #[arg(long)]
     pub max_storage: Option<String>,
@@ -128,6 +134,7 @@ async fn main() {
             data_dir,
             public_url,
             default_expires_in,
+            default_on_expire,
             request_timeout_seconds,
             max_total_storage,
         }) => match data_dir.clone().map(Ok).unwrap_or_else(default_data_dir) {
@@ -140,9 +147,12 @@ async fn main() {
                     &root,
                     &url,
                     cli.basic_auth.as_deref(),
-                    default_expires_in,
-                    std::time::Duration::from_secs(*request_timeout_seconds),
-                    max_total_storage,
+                    server::ServeOptions {
+                        default_expires_in,
+                        default_on_expire: *default_on_expire,
+                        request_timeout: std::time::Duration::from_secs(*request_timeout_seconds),
+                        max_total_storage,
+                    },
                 )
                 .await
             }

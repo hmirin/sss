@@ -56,6 +56,9 @@ fn project_body(args: &ProjectArgs) -> Result<Value> {
         crate::expiry::duration(value)?;
         body["expires_in"] = json!(value);
     }
+    if let Some(value) = &args.on_expire {
+        body["on_expire"] = serde_json::to_value(value)?;
+    }
     if let Some(value) = &args.max_storage {
         body["max_storage"] = json!(value);
     }

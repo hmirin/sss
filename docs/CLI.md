@@ -23,9 +23,9 @@ sss new --config project.json
 sss new --config -
 ```
 
-`new` returns `id`, `url`, `expires_in_seconds`, and `expires_at`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omission means `inherit`. These set project policy. `--basic_auth` authenticates the request.
+`new` returns `id`, `url`, `expires_in_seconds`, `expires_at`, and `on_expire`. Both `--basic_auth_view` and `--basic_auth_write` accept `inherit`, `none`, or `username:password`; omission means `inherit`. These set project policy. `--basic_auth` authenticates the request.
 
-`list` returns project entries with `id`, `name`, `version`, `expires_in_seconds`, and `expires_at`.
+`list` returns project entries with `id`, `name`, `version`, `expires_in_seconds`, `expires_at`, and `on_expire`.
 
 JSON config accepts `name`, `expires_in`, `max_storage`, and `auth.view` / `auth.write`. Each auth object has `mode: inherit`, `mode: none`, or `mode: basic` with `username` and `password`. Explicit flags override the corresponding JSON fields. New projects default to a 500 MiB charged-storage quota across all versions.
 
@@ -59,7 +59,7 @@ sss delete --project ID
 
 Versions are increasing integers starting at 1 and are never reused. Rollback changes the current version and concurrency token. The current version cannot be deleted. Whole-project deletion removes all versions and access settings.
 
-Rollback returns project metadata, including `expires_in_seconds` and `expires_at`.
+Rollback returns project metadata, including `expires_in_seconds`, `expires_at`, and `on_expire`.
 
 Every snapshot uses current project authentication. Publication is atomic on the server; separate browser requests spanning an update can still observe different versions. Use a fixed version URL when you need a stable snapshot.
 
@@ -157,4 +157,20 @@ Durations are positive whole numbers with `s`, `m`, `h`, `d`, or `w`; `none` dis
 
 The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it; `none` removes expiration. Name or authentication changes, reads, and deleting an old version do not renew it. Omitting the setting on `new` uses the server default, which is `none` unless configured. Omitting it on `config` preserves the current lifetime and deadline. Changing the server default never changes existing projects. Updating project settings requires shared server authentication when configured.
 
-**Expiration deletes the entire project and all its versions.** At the deadline, its API and static URLs return 404 and it disappears from `list`. Cleanup runs on startup and every 30 seconds; failed filesystem cleanup is retried. Expired projects cannot be revived. Use `info` or `list` to inspect deadlines before they expire.
+Choose what cleanup does with expired content:
+
+```sh
+sss new --name preview --expires-in 1d --on-expire delete
+sss new --name archive --expires-in 1d --on-expire retain
+sss config --project a1b2c3 --on-expire retain
+sss serve --default-on-expire retain
+# Or set SSS_DEFAULT_ON_EXPIRE=retain in the server environment.
+```
+
+`delete` removes the entire expired project and all its versions. `retain` keeps its files, versions, metadata, and exact deadline in server storage. Both policies make all project APIs and static URLs unavailable at the deadline, including images and fixed versions. Expired projects disappear from `list`, and shared administrator credentials cannot access them. There is no API to browse or revive expired retained projects.
+
+JSON configuration accepts `"on_expire": "delete"` or `"on_expire": "retain"`. CLI flags override JSON values. New projects inherit the server default when the field is omitted or `null`. The product default is `delete`. Config omission or `null` preserves the project's policy. Changing only `on_expire` does not renew the deadline. The policy persists when expiration is disabled and applies if a lifetime is set again. Setting the server default changes only future projects and does not introduce a lifetime.
+
+Cleanup runs on startup and every 30 seconds and removes only expired projects with `on_expire=delete`; failed filesystem cleanup is retried. Retained expired projects and their metadata and version reserves remain charged against the server quota after restart. Use `info` or `list` to inspect `on_expire` and deadlines before they expire. `doctor` without a project reports `default_on_expire` and `default_expires_in_seconds` in its server administration check.
+
+Stores use SQLite format 4. First startup atomically converts format 2 or 3 and assigns the historical `delete` policy to every existing project. Existing settings, versions, lifetimes, deadlines, and files remain intact. Other unsupported formats are rejected. Older binaries without format 4 support refuse the upgraded store before cleanup. Preserve a stopped-server backup before upgrading if a downgrade may be needed.

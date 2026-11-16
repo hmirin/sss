@@ -1,5 +1,47 @@
 use anyhow::{bail, Context, Result};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase", try_from = "String")]
+pub enum ExpiryAction {
+    #[default]
+    Delete,
+    Retain,
+}
+
+impl TryFrom<String> for ExpiryAction {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        match value.as_str() {
+            "delete" => Ok(Self::Delete),
+            "retain" => Ok(Self::Retain),
+            _ => Err("expected delete or retain"),
+        }
+    }
+}
+
+impl ToSql for ExpiryAction {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self {
+            Self::Delete => "delete",
+            Self::Retain => "retain",
+        }
+        .into())
+    }
+}
+
+impl FromSql for ExpiryAction {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "delete" => Ok(Self::Delete),
+            "retain" => Ok(Self::Retain),
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
 
 pub fn now() -> i64 {
     SystemTime::now()

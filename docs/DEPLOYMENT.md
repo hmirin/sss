@@ -16,7 +16,18 @@ Optionally add `SSS_BASIC_AUTH=user:password`; restrict the environment file to 
 
 ## Default Project Lifetime
 
-Set `SSS_DEFAULT_EXPIRES_IN=7d` (or `--default-expires-in 7d`) to give new projects a default idle lifetime. The default is `none`. Projects can override it on creation and administrators can change or remove expiration with `sss config --expires-in`. The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it. Name or authentication changes, reads, and deleting an old version do not renew it. Existing projects are unaffected by server default changes. Expired projects become inaccessible immediately and cannot be revived; all snapshots and metadata are deleted on startup or a 30-second cleanup pass.
+Set `SSS_DEFAULT_EXPIRES_IN=7d` or `--default-expires-in 7d` to give new projects a default idle lifetime. The default is `none`. Projects can override it on creation and administrators can change or remove expiration with `sss config --expires-in`. The deadline is the lifetime after the latest successful publish or rollback. Setting `expires_in` restarts it. Name or authentication changes, reads, and deleting an old version do not renew it. Existing projects are unaffected by server default changes.
+
+Set `SSS_DEFAULT_ON_EXPIRE=retain` or `--default-on-expire retain` to keep expired content in server storage. The product default is `delete`. For example:
+
+```sh
+sss serve --default-expires-in 7d --default-on-expire retain
+sss config --project ID --on-expire retain
+```
+
+The server default applies only to new projects and does not set or change a lifetime. `new` and `config` accept `--on-expire delete` or `--on-expire retain`; JSON uses `on_expire`. CLI flags override JSON. Omission or `null` on creation inherits the server default; omission or `null` on config preserves the policy. Changing only the policy leaves the exact deadline unchanged. Disabling and re-enabling expiration preserves the policy.
+
+At the deadline, both policies make all current, image, fixed-version, raw file, and project API requests unavailable and omit the project from listing. Shared administrator credentials do not bypass expiration. Cleanup deletes only expired projects with `on_expire=delete`, on startup and every 30 seconds. Retained content keeps its files, rows, and deadline and consumes disk. No API browses or revives expired projects. Project summaries expose `on_expire`; `/api/status` and `doctor` without a project expose `default_on_expire`.
 
 ## Docker
 
@@ -31,9 +42,11 @@ The image binds to `0.0.0.0:8080` inside the container. Set `SSS_PUBLIC_URL` to 
 
 SQLite records project policy, current version, the next version number, and retained snapshots. Version files live below `projects/<id>/<number>/`. A data-directory lock prevents two servers from sharing a store. Startup removes uncommitted snapshot directories while keeping all retained versions.
 
-Back up the entire data directory while the service is stopped. Restore it with its original permissions. Retention is explicit: delete obsolete versions to reclaim disk, or configure project expiration. Current versions cannot be deleted.
+Back up the entire data directory while the service is stopped. Restore it with its original permissions. Delete obsolete versions to reclaim disk, or configure expiration with `on_expire=delete`. Current versions cannot be deleted. Expiration with `retain` does not reclaim storage. Retained expired content and its project, version, directory, and file reserves continue to count against the server quota after restart. Expiration with `delete` releases those charges only after successful cleanup.
 
-The API-key prototype uses a different data format. This version requires a fresh directory; it refuses the old format without migrating or deleting its contents.
+New stores use SQLite `user_version=4`. This build atomically upgrades a format 2 or 3 store on first startup by adding the required `projects.on_expire` column. Format 2 stores also gain the required `max_storage` field; format 3 project limits are preserved. Every existing project gets the historical `delete` policy, independently of the configured server default. The conversion preserves all existing project fields, versions, lifetimes, exact deadlines, and files. It runs once. Other unsupported formats, including the API-key prototype, are rejected without migration.
+
+Binaries without format 4 support refuse the upgraded store before cleanup. Keep a stopped-server backup of the complete pre-upgrade store if you may need to return to an older binary. A binary downgrade alone cannot open format 4.
 
 ## Updating
 
